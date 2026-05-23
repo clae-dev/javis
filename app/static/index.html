@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <title>자비스</title>
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/static/icon.svg" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <span class="brand">자비스</span>
+    <span id="status" class="status">연결 중…</span>
+    <div class="header-actions">
+      <button id="voiceOut" class="icon-btn" title="음성 응답 켜기/끄기">🔈</button>
+      <button id="clearBtn" class="icon-btn" title="대화 화면 비우기">🧹</button>
+    </div>
+  </header>
+
+  <main id="log"></main>
+
+  <form id="form">
+    <button id="micBtn" type="button" class="icon-btn" title="음성 입력">🎤</button>
+    <input id="input" placeholder="메시지를 입력하세요" autocomplete="off" autofocus />
+    <button id="send" type="submit">보내기</button>
+  </form>
+
+  <div id="confirm" class="overlay hidden">
+    <div class="dialog">
+      <p id="confirmMsg"></p>
+      <pre id="confirmDetail"></pre>
+      <div class="dialog-actions">
+        <button id="confirmCancel" class="ghost">취소</button>
+        <button id="confirmOk">승인</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

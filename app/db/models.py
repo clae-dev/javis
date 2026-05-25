@@ -49,3 +49,19 @@ class AuditLog(Base):
     response: Mapped[str] = mapped_column(Text, default="")
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserProfile(Base):
+    """사용자에 대해 자비스가 쌓아 올린 한 장짜리 프로필 (싱글톤, id=1).
+
+    반추 단계에서 새 사실이 나올 때마다 갱신되고, 매 응답의 시스템 프롬프트에 주입된다.
+    이게 '나를 알아가는' 느낌의 뼈대다.
+    """
+
+    __tablename__ = "user_profile"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

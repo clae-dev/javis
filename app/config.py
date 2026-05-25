@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     stt_model: str = "whisper-1"
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "alloy"
+    # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 음성에 감정을 싣는다.
+    tts_instructions: str = "따뜻하고 다정한 친구 같은 말투로, 자연스러운 한국어 억양과 감정을 담아 말해줘."
 
     # 외부 검색 (없으면 ddgs 폴백)
     tavily_api_key: str = ""

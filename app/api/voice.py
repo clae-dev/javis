@@ -28,5 +28,6 @@ async def text_to_speech(payload: dict = Body(...)) -> Response:
     if not text:
         raise HTTPException(400, "text 가 비었습니다.")
     voice = (payload or {}).get("voice")
-    audio = await tts.synthesize(text, voice=voice)
+    instructions = (payload or {}).get("instructions")
+    audio = await tts.synthesize(text, voice=voice, instructions=instructions)
     return Response(content=audio, media_type="audio/mpeg")

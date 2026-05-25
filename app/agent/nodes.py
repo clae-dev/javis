@@ -4,11 +4,17 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
-from app.agent.prompts import CLASSIFY_PROMPT, REFLECT_PROMPT, build_system_prompt
+from app.agent.prompts import (
+    ANALYZE_PROMPT,
+    PROFILE_UPDATE_PROMPT,
+    REFLECT_PROMPT,
+    build_system_prompt,
+)
 from app.agent.state import Intent, JarvisState
 from app.db import audit
 from app.llm import chat, fast
 from app.memory.long_term import long_term
+from app.memory.profile import load_summary, update_summary
 from app.tools import TOOLS, TOOLS_BY_NAME, WRITE_TOOLS
 
 log = logging.getLogger("javis.agent")
@@ -24,23 +30,32 @@ def _last_human_text(messages: list) -> str:
 # --- 노드 ---
 
 
-class _IntentResult(BaseModel):
+class _Analysis(BaseModel):
     intent: Intent = Field(description="chat | query | task")
+    user_mood: str = Field(default="중립", description="사용자의 현재 감정을 한 구절로")
 
 
-async def classify_intent(state: JarvisState) -> dict:
+async def analyze(state: JarvisState) -> dict:
+    """의도와 감정을 한 번에 읽고, 사용자 프로필을 끌어와 상태에 싣는다."""
+    profile = dict(state.get("user_profile") or {})
+    try:
+        profile["summary"] = await load_summary()
+    except Exception as exc:
+        log.debug("프로필 로드 실패(무시): %s", exc)
+
     text = _last_human_text(state["messages"])
     if not text:
-        return {"intent": "chat"}
-    classifier = fast().with_structured_output(_IntentResult)
+        return {"intent": "chat", "mood": "중립", "user_profile": profile}
+
+    analyzer = fast().with_structured_output(_Analysis)
     try:
-        result = await classifier.ainvoke(
-            [SystemMessage(content=CLASSIFY_PROMPT), HumanMessage(content=text)]
+        result = await analyzer.ainvoke(
+            [SystemMessage(content=ANALYZE_PROMPT), HumanMessage(content=text)]
         )
-        return {"intent": result.intent}
-    except Exception as exc:  # 분류 실패 시 안전하게 task 로 (도구 접근 허용)
-        log.warning("intent 분류 실패, task 로 폴백: %s", exc)
-        return {"intent": "task"}
+        return {"intent": result.intent, "mood": result.user_mood, "user_profile": profile}
+    except Exception as exc:  # 분석 실패 시 안전하게 task 로 (도구 접근 허용)
+        log.warning("분석 실패, task 로 폴백: %s", exc)
+        return {"intent": "task", "mood": "중립", "user_profile": profile}
 
 
 async def retrieve_memory(state: JarvisState) -> dict:
@@ -54,7 +69,8 @@ async def retrieve_memory(state: JarvisState) -> dict:
 
 
 async def agent(state: JarvisState) -> dict:
-    llm = chat(streaming=True).bind_tools(TOOLS)
+    # 온기를 살짝 주되 도구 호출 신뢰성은 유지되는 선의 온도.
+    llm = chat(streaming=True, temperature=0.5).bind_tools(TOOLS)
     system = SystemMessage(content=build_system_prompt(state))
     response = await llm.ainvoke([system, *state["messages"]])
     return {"messages": [response]}
@@ -122,8 +138,19 @@ class _MemoryExtract(BaseModel):
     items: list[_MemoryFact] = Field(default_factory=list)
 
 
+async def _update_profile(new_facts: list[_MemoryFact]) -> None:
+    old = await load_summary()
+    facts_text = "\n".join(f"- ({f.category}) {f.content}" for f in new_facts)
+    message = f"[기존 프로필]\n{old or '(없음)'}\n\n[새로 알게 된 사실]\n{facts_text}"
+    updated = await fast().ainvoke(
+        [SystemMessage(content=PROFILE_UPDATE_PROMPT), HumanMessage(content=message)]
+    )
+    text = updated.content if isinstance(updated.content, str) else str(updated.content)
+    await update_summary(text)
+
+
 async def reflect(state: JarvisState) -> dict:
-    """대화 끝에서 기억할 가치가 있는 정보만 추려 장기 기억에 저장한다.
+    """대화 끝에서 기억할 가치가 있는 정보를 추려 장기 기억에 저장하고, 프로필을 갱신한다.
 
     어떤 이유로든 실패해도 사용자 응답에는 영향이 없도록 전부 삼킨다.
     """
@@ -141,9 +168,11 @@ async def reflect(state: JarvisState) -> dict:
         extracted = await extractor.ainvoke(
             [SystemMessage(content=REFLECT_PROMPT), HumanMessage(content=transcript)]
         )
-        for fact in extracted.items:
-            if fact.importance >= 4:
-                await long_term.save(fact.content, fact.category, fact.importance)
+        new_facts = [f for f in extracted.items if f.importance >= 4]
+        for fact in new_facts:
+            await long_term.save(fact.content, fact.category, fact.importance)
+        if new_facts:
+            await _update_profile(new_facts)
     except Exception as exc:
         log.warning("반추 단계 실패(무시): %s", exc)
     return {}

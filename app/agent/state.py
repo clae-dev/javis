@@ -13,8 +13,11 @@ class JarvisState(TypedDict):
     # 이번 턴의 의도. chat=잡담, query=조회성 질문, task=실행이 필요한 작업.
     intent: Optional[Intent]
 
+    # 이번 턴에 읽어낸 사용자의 감정 상태 (한 구절). 공감 반응의 근거.
+    mood: Optional[str]
+
     # 장기 기억에서 끌어온 컨텍스트.
     retrieved_context: list[str]
 
-    # 사용자 정적 정보 (이름 등). WS 진입 시 주입.
+    # 사용자 정적 정보 (이름) + 누적 프로필 요약(summary). 시스템 프롬프트에 주입.
     user_profile: dict

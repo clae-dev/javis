@@ -5,14 +5,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import tools_condition
 
-from app.agent.nodes import agent, classify_intent, execute_tools, reflect, retrieve_memory
+from app.agent.nodes import agent, analyze, execute_tools, reflect, retrieve_memory
 from app.agent.state import JarvisState
 from app.config import settings
 
 log = logging.getLogger("javis.graph")
 
 
-def _route_after_classify(state: JarvisState) -> str:
+def _route_after_analyze(state: JarvisState) -> str:
     # 잡담은 기억 조회를 건너뛰고 바로 응답으로. 비용·지연을 아낀다.
     return "agent" if state.get("intent") == "chat" else "retrieve"
 
@@ -20,16 +20,16 @@ def _route_after_classify(state: JarvisState) -> str:
 def build_graph(checkpointer):
     g = StateGraph(JarvisState)
 
-    g.add_node("classify", classify_intent)
+    g.add_node("analyze", analyze)
     g.add_node("retrieve", retrieve_memory)
     g.add_node("agent", agent)
     g.add_node("tools", execute_tools)
     g.add_node("reflect", reflect)
 
-    g.add_edge(START, "classify")
+    g.add_edge(START, "analyze")
     g.add_conditional_edges(
-        "classify",
-        _route_after_classify,
+        "analyze",
+        _route_after_analyze,
         {"agent": "agent", "retrieve": "retrieve"},
     )
     g.add_edge("retrieve", "agent")

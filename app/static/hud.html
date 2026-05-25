@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#04070d" />
+  <title>JAVIS</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/hud.css" />
+</head>
+<body data-state="idle">
+  <div class="grid"></div>
+  <div class="vignette"></div>
+
+  <header class="hud-top">
+    <span class="title">J A V I S</span>
+    <span class="conn" id="conn">연결 중…</span>
+  </header>
+
+  <main class="stage">
+    <canvas id="reactor"></canvas>
+    <div class="status" id="status">대기 중</div>
+  </main>
+
+  <footer class="hud-bottom">
+    <div class="line user" id="userLine"></div>
+    <div class="line reply" id="replyLine"></div>
+  </footer>
+
+  <button id="fsBtn" class="fs-btn" title="전체화면">⛶</button>
+
+  <script src="/static/hud.js"></script>
+</body>
+</html>

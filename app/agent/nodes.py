@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -149,20 +150,20 @@ async def _update_profile(new_facts: list[_MemoryFact]) -> None:
     await update_summary(text)
 
 
-async def reflect(state: JarvisState) -> dict:
-    """대화 끝에서 기억할 가치가 있는 정보를 추려 장기 기억에 저장하고, 프로필을 갱신한다.
+# 백그라운드 반추 태스크 참조 보관(GC 방지).
+_bg_tasks: set[asyncio.Task] = set()
 
-    어떤 이유로든 실패해도 사용자 응답에는 영향이 없도록 전부 삼킨다.
-    """
+
+async def _reflect_worker(messages: list) -> None:
+    """기억 추출 + 프로필 갱신. 응답 경로 밖에서 도는 곁가지 작업."""
     try:
-        recent = state["messages"][-6:]
         transcript = "\n".join(
             f"{'사용자' if isinstance(m, HumanMessage) else '비서'}: {m.content}"
-            for m in recent
+            for m in messages
             if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str) and m.content
         )
         if not transcript.strip():
-            return {}
+            return
 
         extractor = fast().with_structured_output(_MemoryExtract)
         extracted = await extractor.ainvoke(
@@ -175,4 +176,16 @@ async def reflect(state: JarvisState) -> dict:
             await _update_profile(new_facts)
     except Exception as exc:
         log.warning("반추 단계 실패(무시): %s", exc)
+
+
+async def reflect(state: JarvisState) -> dict:
+    """기억 저장을 백그라운드로 떼어내 응답 지연을 없앤다.
+
+    사용자는 기억 저장(LLM 1~2회)을 기다릴 이유가 없으므로, 태스크만 띄우고
+    그래프는 즉시 종료한다. 실제 저장은 응답이 나간 뒤 이어서 끝난다.
+    """
+    recent = list(state["messages"][-6:])
+    task = asyncio.create_task(_reflect_worker(recent))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
     return {}

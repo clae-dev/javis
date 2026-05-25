@@ -11,6 +11,8 @@ __pycache__/
 credentials/*.json
 !credentials/.gitkeep
 
+voice_client/models/
+
 .DS_Store
 .idea/
 .vscode/

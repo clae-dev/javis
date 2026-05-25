@@ -133,6 +133,15 @@ micBtn.addEventListener("click", async () => {
     recorder.stop();
     return;
   }
+  // 브라우저는 localhost 또는 https(보안 컨텍스트)에서만 마이크를 허용한다.
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    note(
+      window.isSecureContext
+        ? "이 브라우저는 마이크 API를 지원하지 않습니다."
+        : "마이크는 localhost 또는 https 에서만 됩니다. 다른 기기에서 IP(예: 192.168.x.x)로 접속 중이라면, PC에서 http://localhost:8000 으로 열거나 HTTPS가 필요합니다."
+    );
+    return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     recorder = new MediaRecorder(stream);
@@ -147,7 +156,14 @@ micBtn.addEventListener("click", async () => {
     recorder.start();
     micBtn.classList.add("recording");
   } catch (err) {
-    note("마이크를 쓸 수 없습니다: " + err.message);
+    const byName = {
+      NotAllowedError:
+        "마이크 권한이 거부됐습니다. 주소창 왼쪽 자물쇠/마이크 아이콘에서 '허용'으로 바꿔 주세요. (Windows: 설정 > 개인정보 보호 및 보안 > 마이크 에서 앱 접근도 켜져 있어야 합니다.)",
+      NotFoundError: "연결된 마이크를 찾을 수 없습니다.",
+      NotReadableError: "다른 앱이 마이크를 점유하고 있어 접근할 수 없습니다.",
+      SecurityError: "보안 컨텍스트가 아니라 마이크를 쓸 수 없습니다. localhost 또는 https 로 접속해 주세요.",
+    };
+    note(byName[err.name] || "마이크를 쓸 수 없습니다: " + err.message);
   }
 });
 

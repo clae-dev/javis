@@ -1,5 +1,5 @@
 // 앱 셸만 캐싱하는 가벼운 서비스 워커. API/WebSocket 은 캐시하지 않는다.
-const CACHE = "javis-shell-v1";
+const CACHE = "javis-shell-v2";
 const SHELL = [
   "/",
   "/static/index.html",

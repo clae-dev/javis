@@ -1,0 +1,6 @@
+vosk>=0.3.45
+sounddevice>=0.4.6
+soundfile>=0.12
+numpy>=1.26
+websocket-client>=1.7
+requests>=2.31

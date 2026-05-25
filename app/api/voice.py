@@ -20,6 +20,15 @@ async def speech_to_text(file: UploadFile = File(...), language: str = "ko") -> 
     return {"text": text}
 
 
+_MEDIA = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "opus": "audio/ogg",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+}
+
+
 @router.post("/tts")
 async def text_to_speech(payload: dict = Body(...)) -> Response:
     if not settings.has_openai:
@@ -29,5 +38,6 @@ async def text_to_speech(payload: dict = Body(...)) -> Response:
         raise HTTPException(400, "text 가 비었습니다.")
     voice = (payload or {}).get("voice")
     instructions = (payload or {}).get("instructions")
-    audio = await tts.synthesize(text, voice=voice, instructions=instructions)
-    return Response(content=audio, media_type="audio/mpeg")
+    fmt = (payload or {}).get("format", "mp3")
+    audio = await tts.synthesize(text, voice=voice, instructions=instructions, fmt=fmt)
+    return Response(content=audio, media_type=_MEDIA.get(fmt, "audio/mpeg"))

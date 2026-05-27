@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from langchain_core.tools import tool
@@ -5,21 +6,11 @@ from langchain_core.tools import tool
 from app.tools._google import SETUP_HINT, build_service
 
 
-@tool
-async def get_upcoming_events(days: int = 7) -> list[dict] | str:
-    """앞으로 N일 이내의 캘린더 일정을 조회한다.
-
-    Args:
-        days: 조회할 일수 (기본 7, 최대 30).
-
-    Returns:
-        [{summary, start, end, location}, ...]
-    """
+def _fetch_upcoming(days: int) -> list[dict] | str:
     service = build_service("calendar", "v3")
     if service is None:
         return SETUP_HINT
 
-    days = max(1, min(days, 30))
     now = datetime.now(timezone.utc)
     result = (
         service.events()
@@ -44,6 +35,33 @@ async def get_upcoming_events(days: int = 7) -> list[dict] | str:
 
 
 @tool
+async def get_upcoming_events(days: int = 7) -> list[dict] | str:
+    """앞으로 N일 이내의 캘린더 일정을 조회한다.
+
+    Args:
+        days: 조회할 일수 (기본 7, 최대 30).
+
+    Returns:
+        [{summary, start, end, location}, ...]
+    """
+    # googleapiclient 은 동기 HTTP 라 워커 스레드로 빼 이벤트 루프(토큰 스트리밍 등)를 막지 않는다.
+    return await asyncio.to_thread(_fetch_upcoming, max(1, min(days, 30)))
+
+
+def _insert_event(body: dict) -> dict | str:
+    service = build_service("calendar", "v3")
+    if service is None:
+        return SETUP_HINT
+
+    created = service.events().insert(calendarId="primary", body=body).execute()
+    return {
+        "id": created.get("id"),
+        "summary": created.get("summary"),
+        "htmlLink": created.get("htmlLink"),
+    }
+
+
+@tool
 async def create_event(
     summary: str,
     start_iso: str,
@@ -60,10 +78,6 @@ async def create_event(
         location: 장소 (선택).
         description: 설명 (선택).
     """
-    service = build_service("calendar", "v3")
-    if service is None:
-        return SETUP_HINT
-
     body = {
         "summary": summary,
         "location": location,
@@ -71,9 +85,4 @@ async def create_event(
         "start": {"dateTime": start_iso},
         "end": {"dateTime": end_iso},
     }
-    created = service.events().insert(calendarId="primary", body=body).execute()
-    return {
-        "id": created.get("id"),
-        "summary": created.get("summary"),
-        "htmlLink": created.get("htmlLink"),
-    }
+    return await asyncio.to_thread(_insert_event, body)

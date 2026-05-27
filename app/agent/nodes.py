@@ -36,27 +36,42 @@ class _Analysis(BaseModel):
     user_mood: str = Field(default="중립", description="사용자의 현재 감정을 한 구절로")
 
 
-async def analyze(state: JarvisState) -> dict:
-    """의도와 감정을 한 번에 읽고, 사용자 프로필을 끌어와 상태에 싣는다."""
-    profile = dict(state.get("user_profile") or {})
+async def _load_summary_safe() -> str | None:
     try:
-        profile["summary"] = await load_summary()
+        return await load_summary()
     except Exception as exc:
         log.debug("프로필 로드 실패(무시): %s", exc)
+        return None
 
-    text = _last_human_text(state["messages"])
+
+async def _classify(text: str) -> _Analysis | None:
     if not text:
-        return {"intent": "chat", "mood": "중립", "user_profile": profile}
-
+        return None
     analyzer = fast().with_structured_output(_Analysis)
     try:
-        result = await analyzer.ainvoke(
+        return await analyzer.ainvoke(
             [SystemMessage(content=ANALYZE_PROMPT), HumanMessage(content=text)]
         )
-        return {"intent": result.intent, "mood": result.user_mood, "user_profile": profile}
     except Exception as exc:  # 분석 실패 시 안전하게 task 로 (도구 접근 허용)
         log.warning("분석 실패, task 로 폴백: %s", exc)
-        return {"intent": "task", "mood": "중립", "user_profile": profile}
+        return _Analysis(intent="task", user_mood="중립")
+
+
+async def analyze(state: JarvisState) -> dict:
+    """의도와 감정을 한 번에 읽고, 사용자 프로필을 끌어와 상태에 싣는다.
+
+    프로필 로드(DB)와 의도/감정 분류(LLM)는 서로 독립이라 동시에 돌려, 매 메시지의
+    임계 경로에서 DB 왕복 한 번을 덜어낸다.
+    """
+    profile = dict(state.get("user_profile") or {})
+    text = _last_human_text(state["messages"])
+
+    summary, result = await asyncio.gather(_load_summary_safe(), _classify(text))
+    if summary is not None:
+        profile["summary"] = summary
+    if result is None:  # 사용자 발화가 없으면 잡담으로 둔다.
+        return {"intent": "chat", "mood": "중립", "user_profile": profile}
+    return {"intent": result.intent, "mood": result.user_mood, "user_profile": profile}
 
 
 async def retrieve_memory(state: JarvisState) -> dict:
@@ -69,11 +84,21 @@ async def retrieve_memory(state: JarvisState) -> dict:
     return {"retrieved_context": context}
 
 
+# 도구 바인딩은 11개 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번
+# 도는 걸 감안해 한 번만 묶어 재사용한다(온기를 살짝 주되 도구 신뢰성은 지키는 온도).
+_agent_llm = None
+
+
+def _get_agent_llm():
+    global _agent_llm
+    if _agent_llm is None:
+        _agent_llm = chat(streaming=True, temperature=0.5).bind_tools(TOOLS)
+    return _agent_llm
+
+
 async def agent(state: JarvisState) -> dict:
-    # 온기를 살짝 주되 도구 호출 신뢰성은 유지되는 선의 온도.
-    llm = chat(streaming=True, temperature=0.5).bind_tools(TOOLS)
     system = SystemMessage(content=build_system_prompt(state))
-    response = await llm.ainvoke([system, *state["messages"]])
+    response = await _get_agent_llm().ainvoke([system, *state["messages"]])
     return {"messages": [response]}
 
 

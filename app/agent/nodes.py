@@ -102,6 +102,26 @@ async def agent(state: JarvisState) -> dict:
     return {"messages": [response]}
 
 
+async def _run_tool_call(call: dict) -> ToolMessage:
+    """도구 하나를 실행하고 감사로그까지 남긴 뒤 ToolMessage 로 돌려준다.
+
+    동시 실행 중 하나가 터져 나머지를 말아먹지 않도록 예외는 여기서 삼킨다.
+    """
+    tool = TOOLS_BY_NAME.get(call["name"])
+    if tool is None:
+        content = f"알 수 없는 도구: {call['name']}"
+        await audit.record("tool", call["name"], call["args"], content, ok=False)
+    else:
+        try:
+            content = await tool.ainvoke(call["args"])
+            await audit.record("tool", call["name"], call["args"], content, ok=True)
+        except Exception as exc:
+            log.exception("도구 실행 오류: %s", call["name"])
+            content = f"도구 실행 중 오류가 났습니다: {exc}"
+            await audit.record("tool", call["name"], call["args"], str(exc), ok=False)
+    return ToolMessage(content=str(content), tool_call_id=call["id"], name=call["name"])
+
+
 async def execute_tools(state: JarvisState) -> dict:
     """도구 실행. 쓰기 도구가 포함되면 실행 전에 한 번 확인(interrupt)을 건다.
 
@@ -134,24 +154,11 @@ async def execute_tools(state: JarvisState) -> dict:
                 ]
             }
 
-    results: list[ToolMessage] = []
-    for call in calls:
-        tool = TOOLS_BY_NAME.get(call["name"])
-        if tool is None:
-            content = f"알 수 없는 도구: {call['name']}"
-            await audit.record("tool", call["name"], call["args"], content, ok=False)
-        else:
-            try:
-                content = await tool.ainvoke(call["args"])
-                await audit.record("tool", call["name"], call["args"], content, ok=True)
-            except Exception as exc:
-                log.exception("도구 실행 오류: %s", call["name"])
-                content = f"도구 실행 중 오류가 났습니다: {exc}"
-                await audit.record("tool", call["name"], call["args"], str(exc), ok=False)
-        results.append(
-            ToolMessage(content=str(content), tool_call_id=call["id"], name=call["name"])
-        )
-    return {"messages": results}
+    # 한 턴에 여러 도구가 호출되면(서로 독립) 동시에 실행한다. 도구마다 별도 세션을
+    # 쓰고 Google 호출은 to_thread 라 병렬이 안전하며, gather 가 호출 순서대로 결과를
+    # 돌려줘 ToolMessage 순서(=tool_call 대응)는 보존된다.
+    results = await asyncio.gather(*(_run_tool_call(c) for c in calls))
+    return {"messages": list(results)}
 
 
 class _MemoryFact(BaseModel):

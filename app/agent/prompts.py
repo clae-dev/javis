@@ -4,20 +4,6 @@ from zoneinfo import ZoneInfo
 from app.agent.state import JarvisState
 from app.config import settings
 
-ANALYZE_PROMPT = """너는 사용자 메시지를 분석한다. 두 가지를 판단해라.
-
-1) intent — 셋 중 하나:
-   - chat: 잡담, 인사, 감정 표현, 가벼운 대화.
-   - query: 정보 조회성 질문. 기억이나 도구로 답을 찾아야 함.
-   - task: 실제로 무언가를 실행/생성/변경해야 하는 요청.
-
-2) user_mood — 사용자의 현재 감정 상태를 짧은 한국어 구절로.
-   (예: '신나 있음', '지치고 스트레스 받음', '불안함', '뿌듯함', '심심함').
-   감정 단서가 없으면 '중립'.
-
-설명 없이 판단 결과만 낸다."""
-
-
 def build_system_prompt(state: JarvisState) -> str:
     now = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d %H:%M (%A)")
     profile = state.get("user_profile") or {}
@@ -60,13 +46,18 @@ def build_system_prompt(state: JarvisState) -> str:
     return base
 
 
-REFLECT_PROMPT = """방금 오간 대화에서 '앞으로도 기억할 가치가 있는' 사실만 추려라.
+REFLECT_PROMPT = """방금 오간 대화를 돌아보고 두 가지를 낸다.
 
-- 선호, 습관, 약속, 진행 중인 일, 인물·관계.
-- 특히 감정과 개인적 사건을 놓치지 마라: 스트레스·고민·기쁜 일·건강·중요한 일정 등.
-- category 는 emotion / relationship / event / preference / project / general 중에서 고른다.
-- 일회성 잡담, 일반 상식, 이번 턴에만 쓰이는 정보는 제외. 없으면 빈 리스트.
-- 각 항목은 한 문장으로 명확하게, 나중에 검색해도 이해되도록 쓴다."""
+1) items — '앞으로도 기억할 가치가 있는' 사실만 추린 목록.
+   - 선호, 습관, 약속, 진행 중인 일, 인물·관계.
+   - 특히 감정과 개인적 사건을 놓치지 마라: 스트레스·고민·기쁜 일·건강·중요한 일정 등.
+   - category 는 emotion / relationship / event / preference / project / general 중에서 고른다.
+   - 일회성 잡담, 일반 상식, 이번 턴에만 쓰이는 정보는 제외. 없으면 빈 리스트.
+   - 각 항목은 한 문장으로 명확하게, 나중에 검색해도 이해되도록 쓴다.
+
+2) user_mood — 대화 끝 시점 사용자의 감정 상태를 짧은 한국어 구절로.
+   (예: '신나 있음', '지치고 스트레스 받음', '불안함', '뿌듯함', '심심함').
+   감정 단서가 없으면 '중립'."""
 
 
 PROFILE_UPDATE_PROMPT = """너는 사용자 프로필을 관리한다. 기존 프로필과 새로 알게 된 사실을 합쳐,

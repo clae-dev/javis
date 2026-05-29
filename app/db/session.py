@@ -1,7 +1,11 @@
+import logging
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+
+log = logging.getLogger("javis.db")
 
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -14,3 +18,17 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+
+    # 기억 검색은 embedding.l2_distance 로 정렬한다. 인덱스가 없으면 매 조회가 풀스캔이라
+    # 기억이 쌓일수록 선형으로 느려진다. HNSW 로 근사 최근접을 태운다.
+    # 구버전 pgvector(<0.5)엔 HNSW 가 없을 수 있어, 실패해도 부팅은 막지 않는다(풀스캔 폴백).
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_memory_items_embedding_hnsw "
+                    "ON memory_items USING hnsw (embedding vector_l2_ops)"
+                )
+            )
+    except Exception as exc:
+        log.warning("HNSW 인덱스 생성 실패(검색은 풀스캔으로 동작): %s", exc)

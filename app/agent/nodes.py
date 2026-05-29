@@ -21,6 +21,16 @@ from app.tools import TOOLS, TOOLS_BY_NAME, WRITE_TOOLS
 log = logging.getLogger("javis.agent")
 
 
+# 응답 경로 밖에서 도는 곁가지 작업(감사 로그·반추)용. 태스크 참조를 들고 있어야 GC 안 됨.
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def _last_human_text(messages: list) -> str:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
@@ -106,19 +116,20 @@ async def _run_tool_call(call: dict) -> ToolMessage:
     """도구 하나를 실행하고 감사로그까지 남긴 뒤 ToolMessage 로 돌려준다.
 
     동시 실행 중 하나가 터져 나머지를 말아먹지 않도록 예외는 여기서 삼킨다.
+    감사 기록은 응답을 막을 이유가 없어 백그라운드로 떼어, 다음 agent 호출 전 DB 왕복을 없앤다.
     """
     tool = TOOLS_BY_NAME.get(call["name"])
     if tool is None:
         content = f"알 수 없는 도구: {call['name']}"
-        await audit.record("tool", call["name"], call["args"], content, ok=False)
+        _spawn(audit.record("tool", call["name"], call["args"], content, ok=False))
     else:
         try:
             content = await tool.ainvoke(call["args"])
-            await audit.record("tool", call["name"], call["args"], content, ok=True)
+            _spawn(audit.record("tool", call["name"], call["args"], content, ok=True))
         except Exception as exc:
             log.exception("도구 실행 오류: %s", call["name"])
             content = f"도구 실행 중 오류가 났습니다: {exc}"
-            await audit.record("tool", call["name"], call["args"], str(exc), ok=False)
+            _spawn(audit.record("tool", call["name"], call["args"], str(exc), ok=False))
     return ToolMessage(content=str(content), tool_call_id=call["id"], name=call["name"])
 
 
@@ -142,7 +153,7 @@ async def execute_tools(state: JarvisState) -> dict:
         )
         if not approved:
             for c in write_calls:
-                await audit.record("tool", c["name"], c["args"], "사용자 취소", ok=False)
+                _spawn(audit.record("tool", c["name"], c["args"], "사용자 취소", ok=False))
             return {
                 "messages": [
                     ToolMessage(
@@ -182,10 +193,6 @@ async def _update_profile(new_facts: list[_MemoryFact]) -> None:
     await update_summary(text)
 
 
-# 백그라운드 반추 태스크 참조 보관(GC 방지).
-_bg_tasks: set[asyncio.Task] = set()
-
-
 async def _reflect_worker(messages: list) -> None:
     """기억 추출 + 프로필 갱신. 응답 경로 밖에서 도는 곁가지 작업."""
     try:
@@ -217,7 +224,5 @@ async def reflect(state: JarvisState) -> dict:
     그래프는 즉시 종료한다. 실제 저장은 응답이 나간 뒤 이어서 끝난다.
     """
     recent = list(state["messages"][-6:])
-    task = asyncio.create_task(_reflect_worker(recent))
-    _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    _spawn(_reflect_worker(recent))
     return {}

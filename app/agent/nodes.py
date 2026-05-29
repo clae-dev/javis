@@ -182,10 +182,9 @@ class _MemoryExtract(BaseModel):
     items: list[_MemoryFact] = Field(default_factory=list)
 
 
-async def _update_profile(new_facts: list[_MemoryFact]) -> None:
-    old = await load_summary()
+async def _update_profile(new_facts: list[_MemoryFact], old_summary: str | None) -> None:
     facts_text = "\n".join(f"- ({f.category}) {f.content}" for f in new_facts)
-    message = f"[기존 프로필]\n{old or '(없음)'}\n\n[새로 알게 된 사실]\n{facts_text}"
+    message = f"[기존 프로필]\n{old_summary or '(없음)'}\n\n[새로 알게 된 사실]\n{facts_text}"
     updated = await fast().ainvoke(
         [SystemMessage(content=PROFILE_UPDATE_PROMPT), HumanMessage(content=message)]
     )
@@ -193,7 +192,7 @@ async def _update_profile(new_facts: list[_MemoryFact]) -> None:
     await update_summary(text)
 
 
-async def _reflect_worker(messages: list) -> None:
+async def _reflect_worker(messages: list, old_summary: str | None) -> None:
     """기억 추출 + 프로필 갱신. 응답 경로 밖에서 도는 곁가지 작업."""
     try:
         transcript = "\n".join(
@@ -209,10 +208,9 @@ async def _reflect_worker(messages: list) -> None:
             [SystemMessage(content=REFLECT_PROMPT), HumanMessage(content=transcript)]
         )
         new_facts = [f for f in extracted.items if f.importance >= 4]
-        for fact in new_facts:
-            await long_term.save(fact.content, fact.category, fact.importance)
         if new_facts:
-            await _update_profile(new_facts)
+            await long_term.save_many([(f.content, f.category, f.importance) for f in new_facts])
+            await _update_profile(new_facts, old_summary)
     except Exception as exc:
         log.warning("반추 단계 실패(무시): %s", exc)
 
@@ -224,5 +222,7 @@ async def reflect(state: JarvisState) -> dict:
     그래프는 즉시 종료한다. 실제 저장은 응답이 나간 뒤 이어서 끝난다.
     """
     recent = list(state["messages"][-6:])
-    _spawn(_reflect_worker(recent))
+    # analyze 가 이미 끌어온 프로필 요약을 넘겨, 프로필 갱신 때 같은 행을 다시 읽지 않게 한다.
+    summary = (state.get("user_profile") or {}).get("summary")
+    _spawn(_reflect_worker(recent, summary))
     return {}

@@ -35,6 +35,26 @@ class LongTermMemory:
             )
             await session.commit()
 
+    async def save_many(self, facts: list[tuple[str, str, int]]) -> None:
+        """여러 기억을 한 번에 저장한다.
+
+        반추 단계는 보통 여러 조각을 한꺼번에 추려낸다. 조각마다 임베딩 호출 + 커밋을
+        돌리면 왕복이 개수만큼 쌓이므로, 임베딩은 한 번에 묶어 요청하고 insert 는 한
+        트랜잭션으로 커밋한다.
+        """
+        cleaned = [(c.strip(), cat, imp) for c, cat, imp in facts if c and c.strip()]
+        if not cleaned:
+            return
+        vecs = await embeddings().aembed_documents([c for c, _, _ in cleaned])
+        async with async_session() as session:
+            session.add_all(
+                [
+                    MemoryItem(content=c, category=cat, importance=imp, embedding=vec)
+                    for (c, cat, imp), vec in zip(cleaned, vecs)
+                ]
+            )
+            await session.commit()
+
     async def retrieve(self, query: str, top_k: int = 5) -> list[str]:
         query = query.strip()
         if not query:

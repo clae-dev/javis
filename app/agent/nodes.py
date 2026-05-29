@@ -2,16 +2,16 @@ import asyncio
 import logging
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from app.agent.prompts import (
-    ANALYZE_PROMPT,
     PROFILE_UPDATE_PROMPT,
     REFLECT_PROMPT,
     build_system_prompt,
 )
-from app.agent.state import Intent, JarvisState
+from app.agent.state import JarvisState
 from app.db import audit
 from app.llm import chat, fast
 from app.memory.long_term import long_term
@@ -23,6 +23,15 @@ log = logging.getLogger("javis.agent")
 
 # 응답 경로 밖에서 도는 곁가지 작업(감사 로그·반추)용. 태스크 참조를 들고 있어야 GC 안 됨.
 _bg_tasks: set[asyncio.Task] = set()
+
+# 직전 턴 끝에서 읽어둔 감정을 스레드(대화)별로 보관한다. 반추가 응답 뒤 백그라운드로
+# 채워 넣고, 다음 턴의 prepare 가 읽어 시스템 프롬프트에 싣는다. 감정은 한 턴 지연되지만
+# 분류 LLM 호출이 임계 경로(첫 토큰까지)에서 사라진다. 프로세스 메모리라 재시작 시 중립부터.
+_mood_by_thread: dict[str, str] = {}
+
+
+def _thread_id(config: RunnableConfig | None) -> str:
+    return ((config or {}).get("configurable") or {}).get("thread_id", "default")
 
 
 def _spawn(coro) -> None:
@@ -41,11 +50,6 @@ def _last_human_text(messages: list) -> str:
 # --- 노드 ---
 
 
-class _Analysis(BaseModel):
-    intent: Intent = Field(description="chat | query | task")
-    user_mood: str = Field(default="중립", description="사용자의 현재 감정을 한 구절로")
-
-
 async def _load_summary_safe() -> str | None:
     try:
         return await load_summary()
@@ -54,44 +58,29 @@ async def _load_summary_safe() -> str | None:
         return None
 
 
-async def _classify(text: str) -> _Analysis | None:
-    if not text:
-        return None
-    analyzer = fast().with_structured_output(_Analysis)
+async def _retrieve_safe(text: str) -> list[str]:
     try:
-        return await analyzer.ainvoke(
-            [SystemMessage(content=ANALYZE_PROMPT), HumanMessage(content=text)]
-        )
-    except Exception as exc:  # 분석 실패 시 안전하게 task 로 (도구 접근 허용)
-        log.warning("분석 실패, task 로 폴백: %s", exc)
-        return _Analysis(intent="task", user_mood="중립")
+        return await long_term.retrieve(text, top_k=5)
+    except Exception as exc:
+        log.warning("기억 조회 실패: %s", exc)
+        return []
 
 
-async def analyze(state: JarvisState) -> dict:
-    """의도와 감정을 한 번에 읽고, 사용자 프로필을 끌어와 상태에 싣는다.
+async def prepare(state: JarvisState, config: RunnableConfig) -> dict:
+    """응답 직전 맥락을 모은다: 프로필 요약 + 관련 기억 + 직전 턴 감정.
 
-    프로필 로드(DB)와 의도/감정 분류(LLM)는 서로 독립이라 동시에 돌려, 매 메시지의
-    임계 경로에서 DB 왕복 한 번을 덜어낸다.
+    프로필 로드(DB)와 기억 조회(임베딩+벡터)는 서로 독립이라 동시에 돌린다. 감정은
+    분류 LLM 을 임계 경로에서 부르지 않고, 반추가 직전 턴 끝에 채워 둔 값을 읽어 쓴다.
     """
     profile = dict(state.get("user_profile") or {})
     text = _last_human_text(state["messages"])
 
-    summary, result = await asyncio.gather(_load_summary_safe(), _classify(text))
+    summary, context = await asyncio.gather(_load_summary_safe(), _retrieve_safe(text))
     if summary is not None:
         profile["summary"] = summary
-    if result is None:  # 사용자 발화가 없으면 잡담으로 둔다.
-        return {"intent": "chat", "mood": "중립", "user_profile": profile}
-    return {"intent": result.intent, "mood": result.user_mood, "user_profile": profile}
 
-
-async def retrieve_memory(state: JarvisState) -> dict:
-    text = _last_human_text(state["messages"])
-    try:
-        context = await long_term.retrieve(text, top_k=5)
-    except Exception as exc:
-        log.warning("기억 조회 실패: %s", exc)
-        context = []
-    return {"retrieved_context": context}
+    mood = _mood_by_thread.get(_thread_id(config), "중립")
+    return {"user_profile": profile, "retrieved_context": context, "mood": mood}
 
 
 # 도구 바인딩은 11개 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번
@@ -178,8 +167,9 @@ class _MemoryFact(BaseModel):
     importance: int = 5
 
 
-class _MemoryExtract(BaseModel):
+class _Reflection(BaseModel):
     items: list[_MemoryFact] = Field(default_factory=list)
+    user_mood: str = Field(default="중립", description="대화 끝 시점 사용자의 감정을 한 구절로")
 
 
 async def _update_profile(new_facts: list[_MemoryFact], old_summary: str | None) -> None:
@@ -192,8 +182,12 @@ async def _update_profile(new_facts: list[_MemoryFact], old_summary: str | None)
     await update_summary(text)
 
 
-async def _reflect_worker(messages: list, old_summary: str | None) -> None:
-    """기억 추출 + 프로필 갱신. 응답 경로 밖에서 도는 곁가지 작업."""
+async def _reflect_worker(messages: list, old_summary: str | None, thread_id: str) -> None:
+    """기억 추출 + 프로필 갱신 + 다음 턴 감정 추출. 응답 경로 밖에서 도는 곁가지 작업.
+
+    기억 추출과 감정 읽기를 한 번의 구조화 호출로 묶어, 백그라운드 LLM 왕복을 1회로 둔다.
+    읽어낸 감정은 스레드별로 보관해 다음 턴 prepare 가 시스템 프롬프트에 싣는다.
+    """
     try:
         transcript = "\n".join(
             f"{'사용자' if isinstance(m, HumanMessage) else '비서'}: {m.content}"
@@ -203,11 +197,13 @@ async def _reflect_worker(messages: list, old_summary: str | None) -> None:
         if not transcript.strip():
             return
 
-        extractor = fast().with_structured_output(_MemoryExtract)
-        extracted = await extractor.ainvoke(
+        extractor = fast().with_structured_output(_Reflection)
+        result = await extractor.ainvoke(
             [SystemMessage(content=REFLECT_PROMPT), HumanMessage(content=transcript)]
         )
-        new_facts = [f for f in extracted.items if f.importance >= 4]
+        _mood_by_thread[thread_id] = (result.user_mood or "중립").strip() or "중립"
+
+        new_facts = [f for f in result.items if f.importance >= 4]
         if new_facts:
             await long_term.save_many([(f.content, f.category, f.importance) for f in new_facts])
             await _update_profile(new_facts, old_summary)
@@ -215,14 +211,14 @@ async def _reflect_worker(messages: list, old_summary: str | None) -> None:
         log.warning("반추 단계 실패(무시): %s", exc)
 
 
-async def reflect(state: JarvisState) -> dict:
-    """기억 저장을 백그라운드로 떼어내 응답 지연을 없앤다.
+async def reflect(state: JarvisState, config: RunnableConfig) -> dict:
+    """기억 저장과 감정 읽기를 백그라운드로 떼어내 응답 지연을 없앤다.
 
-    사용자는 기억 저장(LLM 1~2회)을 기다릴 이유가 없으므로, 태스크만 띄우고
-    그래프는 즉시 종료한다. 실제 저장은 응답이 나간 뒤 이어서 끝난다.
+    사용자는 기억 저장(LLM)을 기다릴 이유가 없으므로 태스크만 띄우고 그래프는 즉시
+    종료한다. 여기서 읽은 감정은 다음 턴 응답에 반영된다(한 턴 지연).
     """
     recent = list(state["messages"][-6:])
-    # analyze 가 이미 끌어온 프로필 요약을 넘겨, 프로필 갱신 때 같은 행을 다시 읽지 않게 한다.
+    # prepare 가 이미 끌어온 프로필 요약을 넘겨, 프로필 갱신 때 같은 행을 다시 읽지 않게 한다.
     summary = (state.get("user_profile") or {}).get("summary")
-    _spawn(_reflect_worker(recent, summary))
+    _spawn(_reflect_worker(recent, summary, _thread_id(config)))
     return {}

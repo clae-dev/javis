@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Body, File, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.voice import stt, tts
@@ -30,7 +30,7 @@ _MEDIA = {
 
 
 @router.post("/tts")
-async def text_to_speech(payload: dict = Body(...)) -> Response:
+async def text_to_speech(payload: dict = Body(...)) -> StreamingResponse:
     if not settings.has_openai:
         raise HTTPException(503, _NO_KEY)
     text = (payload or {}).get("text", "").strip()
@@ -39,5 +39,7 @@ async def text_to_speech(payload: dict = Body(...)) -> Response:
     voice = (payload or {}).get("voice")
     instructions = (payload or {}).get("instructions")
     fmt = (payload or {}).get("format", "mp3")
-    audio = await tts.synthesize(text, voice=voice, instructions=instructions, fmt=fmt)
-    return Response(content=audio, media_type=_MEDIA.get(fmt, "audio/mpeg"))
+    return StreamingResponse(
+        tts.synthesize(text, voice=voice, instructions=instructions, fmt=fmt),
+        media_type=_MEDIA.get(fmt, "audio/mpeg"),
+    )

@@ -18,33 +18,41 @@ def _fetch_recent(max_results: int, query: str) -> list[dict] | str:
         .list(userId="me", maxResults=max_results, q=query or None)
         .execute()
     )
+    refs = listing.get("messages", [])
+    if not refs:
+        return []
 
-    # 메시지별 메타데이터는 같은 service(=비스레드세이프 httplib2)로 순차 조회한다.
-    # 전체가 한 워커 스레드에서 도므로 이벤트 루프는 막지 않는다.
-    out: list[dict] = []
-    for ref in listing.get("messages", []):
-        msg = (
-            service.users()
-            .messages()
-            .get(
+    # 메시지별 메타데이터를 메일 수만큼 순차 get 하면 N+1 왕복이라 느리다. 한 번의 batch
+    # HTTP 로 묶어 왕복을 1회로 줄인다. 응답은 콜백으로 비순차 도착하니 id 로 모았다가
+    # 목록 순서대로 재조립한다(Gmail batch 상한 100, max_results 는 25라 한 배치에 들어간다).
+    by_id: dict[str, dict] = {}
+
+    def _collect(req_id: str, msg, exc):
+        if exc is not None or msg is None:
+            return
+        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+        by_id[req_id] = {
+            "id": req_id,
+            "from": headers.get("From", ""),
+            "subject": headers.get("Subject", "(제목 없음)"),
+            "date": headers.get("Date", ""),
+            "snippet": msg.get("snippet", ""),
+        }
+
+    batch = service.new_batch_http_request(callback=_collect)
+    for ref in refs:
+        batch.add(
+            service.users().messages().get(
                 userId="me",
                 id=ref["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date"],
-            )
-            .execute()
+            ),
+            request_id=ref["id"],
         )
-        headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-        out.append(
-            {
-                "id": ref["id"],
-                "from": headers.get("From", ""),
-                "subject": headers.get("Subject", "(제목 없음)"),
-                "date": headers.get("Date", ""),
-                "snippet": msg.get("snippet", ""),
-            }
-        )
-    return out
+    batch.execute()
+
+    return [by_id[ref["id"]] for ref in refs if ref["id"] in by_id]
 
 
 @tool

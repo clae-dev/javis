@@ -32,3 +32,13 @@ async def init_db() -> None:
             )
     except Exception as exc:
         log.warning("HNSW 인덱스 생성 실패(검색은 풀스캔으로 동작): %s", exc)
+
+    # 스케줄러가 1분마다 '아직 안 알린 마감된 리마인더'를 조회한다. 인덱스가 없으면 매번
+    # 풀스캔이라 리마인더가 쌓일수록 느려진다. 조회 조건과 똑같은 부분 인덱스로 좁힌다.
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_reminders_due ON reminders (due_at) "
+                "WHERE done = false AND notified_at IS NULL"
+            )
+        )

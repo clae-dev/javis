@@ -42,3 +42,17 @@ async def init_db() -> None:
                 "WHERE done = false AND notified_at IS NULL"
             )
         )
+
+    # 감사로그는 시간순 조회와 종류별 통계 조회가 빈번하다. 인덱스가 없으면 로그가
+    # 쌓일수록 선형으로 느려진다.
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_audit_log_created_at ON audit_log (created_at)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_audit_log_kind_ok ON audit_log (kind, ok)"
+            )
+        )

@@ -18,6 +18,7 @@ from app.config import GOOGLE_SCOPES, settings  # noqa: E402
 SCOPES = GOOGLE_SCOPES
 
 
+
 def main() -> None:
     if not os.path.exists(settings.google_credentials_path):
         raise SystemExit(

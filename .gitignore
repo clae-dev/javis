@@ -16,3 +16,11 @@ voice_client/models/
 .DS_Store
 .idea/
 .vscode/
+convert_md_to_pdf.py
+docs/부산온길AI_AI이미지분석_구현가이드.html
+docs/부산온길AI_AI이미지분석_구현가이드.md
+docs/부산온길AI_AI이미지분석_구현가이드.pdf
+docs/부산온길AI_개발계획서.md
+docs/부산온길AI_통합_개발계획서_완전판.html
+docs/부산온길AI_통합_개발계획서_완전판.md
+docs/부산온길AI_통합_개발계획서_완전판.pdf

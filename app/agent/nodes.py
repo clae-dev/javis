@@ -95,6 +95,18 @@ def _get_agent_llm():
     return _agent_llm
 
 
+# 반사 단계에서 기억과 감정을 추출할 때 쓸 LLM 바인딩. Pydantic 스키마 컴파일은 비싸므로
+# 한 번만 묶고 재사용한다.
+_reflection_extractor = None
+
+
+def _get_reflection_extractor():
+    global _reflection_extractor
+    if _reflection_extractor is None:
+        _reflection_extractor = fast().with_structured_output(_Reflection)
+    return _reflection_extractor
+
+
 async def agent(state: JarvisState) -> dict:
     system = SystemMessage(content=build_system_prompt(state))
     response = await _get_agent_llm().ainvoke([system, *state["messages"]])
@@ -197,7 +209,7 @@ async def _reflect_worker(messages: list, old_summary: str | None, thread_id: st
         if not transcript.strip():
             return
 
-        extractor = fast().with_structured_output(_Reflection)
+        extractor = _get_reflection_extractor()
         result = await extractor.ainvoke(
             [SystemMessage(content=REFLECT_PROMPT), HumanMessage(content=transcript)]
         )

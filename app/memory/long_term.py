@@ -78,13 +78,15 @@ class LongTermMemory:
             return []
         vec = await self.embed(query)
         async with async_session() as session:
+            # content 만 쓰는데 행 전체를 잡으면 embedding(1536-float 벡터)까지 매 턴 전송·
+            # 역직렬화한다. 거리는 ORDER BY 안에서 DB 가 계산하니 content 컬럼만 받으면 된다.
             stmt = (
-                select(MemoryItem)
+                select(MemoryItem.content)
                 .order_by(MemoryItem.embedding.l2_distance(vec))
                 .limit(top_k)
             )
             rows = await session.execute(stmt)
-            return [row.content for row in rows.scalars()]
+            return list(rows.scalars())
 
 
 long_term = LongTermMemory()

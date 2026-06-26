@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     fast_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
-    stt_model: str = "whisper-1"
+    # gpt-4o-mini-transcribe 는 whisper-1 보다 응답이 빠르다. 호환 문제가 있으면
+    # .env 에서 STT_MODEL=whisper-1 로 되돌릴 수 있다.
+    stt_model: str = "gpt-4o-mini-transcribe"
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "alloy"
     # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 음성에 감정을 싣는다.

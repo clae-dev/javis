@@ -4,3 +4,5 @@ soundfile>=0.12
 numpy>=1.26
 websocket-client>=1.7
 requests>=2.31
+openwakeword>=0.6
+onnxruntime>=1.17

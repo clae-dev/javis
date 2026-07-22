@@ -12,7 +12,8 @@
 - **캘린더**: 일정 조회·생성(생성은 확인 필요).
 - **Gmail**: 메일 조회·전송(전송은 확인 필요).
 - **웹 검색**: 최신 정보가 필요할 때. Tavily 키가 있으면 쓰고, 없으면 무료 폴백.
-- **음성**: 마이크로 말하면 Whisper로 받아쓰고, 응답을 TTS로 읽어준다.
+- **코드**: 등록한 프로젝트를 Claude Code로 읽고 고친다. 수정은 확인 필요.
+- **음성**: 마이크로 말하면 Whisper로 받아쓰고, 응답을 TTS로 읽어준다. 받아쓰기는 로컬로도 돌릴 수 있다.
 - **능동 알림**: 마감된 리마인더, 아침 일정 브리핑을 먼저 알려준다.
 - **PWA**: 휴대폰/데스크톱에 설치 가능. 브라우저 알림 지원.
 
@@ -25,7 +26,7 @@
         │
    LangGraph Agent ── PostgreSQL + pgvector (장기 기억 / 대화 체크포인트)
         │
-   Tools: 시간, 웹검색, 기억, 리마인더, 캘린더, Gmail
+   Tools: 시간, 웹검색, 기억, 리마인더, 캘린더, Gmail, 코드(Claude Code CLI)
         ↑
    APScheduler (능동 알림)
 ```
@@ -64,7 +65,10 @@ uvicorn app.main:app --reload
 | `FAST_MODEL` | 의도 분류·반추용 경량 모델 | `gpt-4o-mini` |
 | `EMBEDDING_MODEL` | 임베딩 모델 | `text-embedding-3-small` |
 | `STT_MODEL` / `TTS_MODEL` / `TTS_VOICE` | 음성 모델·목소리 | whisper-1 / gpt-4o-mini-tts / alloy |
+| `STT_ENGINE` / `STT_LOCAL_MODEL` | `local` 이면 faster-whisper로 이 기계에서 받아쓴다 | `openai` / `small` |
 | `TAVILY_API_KEY` | 웹 검색용(선택, 없으면 무료 폴백) | (빈값) |
+| `CODE_PROJECTS` | 음성으로 다룰 코드 프로젝트 `이름=경로` 목록 | (빈값) |
+| `CODE_MODEL` | 코드 작업에 쓸 Claude 모델 | `opus` |
 | `DATABASE_URL` | Postgres 접속 문자열 | compose 기본값 |
 | `TIMEZONE` | 스케줄러·시간 표시 기준 | `Asia/Seoul` |
 | `USE_POSTGRES_CHECKPOINTER` | 대화 영속화 | `true` |
@@ -85,6 +89,33 @@ uvicorn app.main:app --reload
 
 자격증명이 없으면 해당 도구만 "설정이 필요합니다"라고 답하고 나머지는 정상 동작한다.
 
+## 코드 연결 (Claude Code)
+
+말로 코드를 다루기 위한 통로. 자비스가 `claude -p` 를 대신 돌려 프로젝트를 읽거나 고친다.
+운전·육아처럼 화면을 못 볼 때 쓰려고 만들었다.
+
+1. [Claude Code](https://claude.com/claude-code)를 설치하고 로그인해 둔다 (`claude --version` 으로 확인).
+2. `.env` 에 다룰 프로젝트를 등록한다. **여기 적은 것만 열린다.**
+
+   ```bash
+   CODE_PROJECTS=javis|자비스=C:\workspace\Javis,펫=C:\workspace\DomabaemPet
+   ```
+
+   말로 부르는 이름이 폴더명과 다르면 `|` 로 별칭을 여러 개 단다("자비스 프로젝트에서…").
+3. **백엔드를 Docker 밖에서 띄운다.** 컨테이너 안에는 `claude` 도 프로젝트 경로도 없다:
+
+   ```bash
+   docker compose up -d postgres     # DB만 컨테이너로
+   uvicorn app.main:app --reload     # 앱은 호스트에서
+   ```
+
+동작 방식과 한계:
+
+- **조회**(`ask_project`)는 읽기 도구(Read·Grep·Glob)만 받는다. 파일을 건드릴 수 없다.
+- **수정**(`edit_project`)은 실행 전 확인을 거치고, 파일 수정만 한다. **셸 명령은 주지 않는다** — 빌드·테스트·git 은 직접 해야 한다. 말 한 마디로 임의 명령이 도는 걸 막기 위해서다.
+- 프로젝트별로 대화 세션이 `credentials/code_sessions.json` 에 남아, 이어 물으면 맥락이 유지된다.
+- `claude` 가 없거나 `CODE_PROJECTS` 가 비면 해당 도구만 안내 문구를 돌려주고 나머지는 정상 동작한다.
+
 ## 점검용 엔드포인트
 
 - `GET /health` — 상태, OpenAI 키 유무
@@ -100,7 +131,7 @@ app/
 ├── config.py          설정
 ├── llm.py             OpenAI 클라이언트 팩토리(재시도/타임아웃)
 ├── agent/             LangGraph (state, nodes, graph, prompts, runtime)
-├── tools/             builtin, search, reminders, calendar, gmail
+├── tools/             builtin, search, reminders, calendar, gmail, code
 ├── memory/            장기 기억 (pgvector)
 ├── voice/             STT / TTS
 ├── api/               ws, rest, voice, notifications
@@ -126,5 +157,8 @@ scripts/
 - [x] 음성 (STT/TTS)
 - [x] 능동 알림 (스케줄러)
 - [x] 설치형 PWA
-- [ ] 화자 인식 / wake word
+- [x] 웨이크워드(openWakeWord) / 박수 깨우기
+- [x] Claude Code 연동 (음성 코딩)
+- [x] 대화 모드 (답변 뒤 깨우지 않고 이어 말하기) / 운전 모드
+- [ ] 화자 인식
 - [ ] 멀티 디바이스 동기화

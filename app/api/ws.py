@@ -67,6 +67,8 @@ async def chat_ws(ws: WebSocket) -> None:
             payload = {
                 "messages": [HumanMessage(content=content)],
                 "user_profile": profile,
+                # 음성 데몬이 운전 모드로 붙으면 "drive" 가 온다. 답변 길이를 줄이는 데 쓴다.
+                "mode": (data or {}).get("mode"),
             }
 
             # interrupt 가 걸리면 confirm 응답을 받아 재개. 여러 번 걸릴 수도 있어 루프.

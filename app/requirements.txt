@@ -22,6 +22,9 @@ google-api-python-client>=2.130
 google-auth>=2.30
 google-auth-oauthlib>=1.2
 
+# 로컬 STT (STT_ENGINE=local 일 때만 실제로 로드된다)
+faster-whisper>=1.0
+
 ddgs>=5.0
 tavily-python>=0.3
 apscheduler>=3.10,<4

@@ -16,3 +16,6 @@ class JarvisState(TypedDict):
 
     # 사용자 정적 정보 (이름) + 누적 프로필 요약(summary). 시스템 프롬프트에 주입.
     user_profile: dict
+
+    # 대화 환경. "drive" 면 운전 중이라 화면을 못 보므로 답을 짧게 줄인다.
+    mode: Optional[str]

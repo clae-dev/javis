@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 from app.agent.state import JarvisState
 from app.config import settings
+from app.tools.code import project_names
 
 def build_system_prompt(state: JarvisState) -> str:
     now = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d %H:%M (%A)")
@@ -29,6 +30,18 @@ def build_system_prompt(state: JarvisState) -> str:
 쓸 수 있는 도구: 현재 시각, 웹 검색, 장기 기억(저장/검색), 리마인더(등록/조회/완료),
 구글 캘린더(조회/생성), Gmail(조회/전송)."""
 
+    if projects := project_names():
+        base += (
+            f"\n\n[코드 작업] 다룰 수 있는 프로젝트: {', '.join(projects)}\n"
+            "- project 인자에는 반드시 위 이름 중 하나를 그대로 넣는다. {owner} 님이 다르게"
+            " 부르면 가장 가까운 것으로 옮겨 넣고, 짐작이 안 되면 어느 프로젝트인지 되묻는다.\n"
+            "- 코드를 봐야 답할 수 있으면 추측하지 말고 ask_project 로 실제 코드를 확인한다.\n"
+            "- 고쳐 달라고 하면 edit_project 를 쓴다. 파일 수정만 되고 빌드·테스트·git 은"
+            " 안 되니, 그런 건 직접 하시라고 알려준다.\n"
+            "- 도구가 돌려준 긴 설명을 그대로 옮기지 말고, 무엇을 확인했고 무엇이 바뀌었는지로"
+            " 간추린다."
+        ).replace("{owner}", owner)
+
     if summary:
         base += f"\n\n[{owner} 님에 대해 내가 알고 있는 것]\n{summary}"
 
@@ -36,6 +49,14 @@ def build_system_prompt(state: JarvisState) -> str:
         base += (
             f"\n\n[지금 {owner} 님 상태] {mood}\n"
             "이 감정을 헤아려서 반응해라. 형식적인 위로가 아니라 진심으로, 다만 과하지 않게."
+        )
+
+    if state.get("mode") == "drive":
+        base += (
+            "\n\n[지금 운전 중]\n"
+            "화면을 볼 수 없다. 두세 문장으로 짧게, 말로만 전달해라. 목록·코드·URL·파일 경로를"
+            " 읊지 말고, 코드 작업은 무엇이 바뀌었는지 한 줄로만 말해라. 더 듣고 싶어 하면"
+            " 그때 이어서 설명한다."
         )
 
     context = state.get("retrieved_context") or []

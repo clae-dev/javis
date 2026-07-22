@@ -6,6 +6,7 @@
 
 from app.tools.builtin import get_current_time, recall, remember
 from app.tools.calendar import create_event, get_upcoming_events
+from app.tools.code import ask_project, edit_project
 from app.tools.gmail import list_recent_emails, send_email
 from app.tools.reminders import complete_reminder, create_reminder, list_reminders
 from app.tools.search import web_search
@@ -22,6 +23,8 @@ TOOLS = [
     create_event,
     list_recent_emails,
     send_email,
+    ask_project,
+    edit_project,
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
@@ -30,4 +33,5 @@ TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 WRITE_TOOLS = {
     "create_event",
     "send_email",
+    "edit_project",
 }

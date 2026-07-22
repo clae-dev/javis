@@ -16,6 +16,7 @@ import os
 import queue
 import random
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -92,6 +93,16 @@ OWW_ENABLE = os.environ.get("JAVIS_OWW", "1") != "0"
 OWW_MODEL = os.environ.get("JAVIS_OWW_MODEL", "hey_jarvis")
 OWW_THRESHOLD = float(os.environ.get("JAVIS_OWW_THRESHOLD", "0.5"))  # 0~1, 높을수록 엄격
 
+# 답변이 끝난 뒤 이만큼(초)은 깨우지 않고 바로 이어 말할 수 있다. 0 이면 매번 다시 불러야 한다.
+CONV_TIMEOUT = float(os.environ.get("JAVIS_CONV_TIMEOUT", "10"))
+
+# 첫 덩어리는 로컬 음성(Windows SAPI)으로 즉시 내보낸다. 클라우드 왕복이 빠지는 만큼
+# 첫 소리가 빨라진다. 대신 첫 문장만 목소리가 다르다 — 거슬리면 0 으로 끈다.
+TTS_FIRST_LOCAL = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "1") != "0"
+
+# 운전 모드. 백엔드가 답변을 두세 문장으로 줄인다.
+DRIVE_MODE = os.environ.get("JAVIS_DRIVE", "0") != "0"
+
 
 def _resolve_device(hint: str, kind: str):
     """이름 일부로 오디오 장치를 찾는다. 못 찾거나 힌트가 없으면 None(기본 장치)."""
@@ -165,6 +176,55 @@ def _first_cut(buf: str) -> int:
         sp = buf.rfind(" ", 0, FIRST_MAX)
         return sp + 1 if sp >= FIRST_MIN else FIRST_MAX
     return -1
+
+
+_KOREAN_VOICE_HINTS = ("korean", "한국")
+
+
+def _tts_local(text: str):
+    """Windows SAPI 로 즉시 합성해 (오디오, 샘플레이트) 를 준다. 실패하면 None.
+
+    클라우드 왕복(수백 ms)이 통째로 빠지므로 답변 첫 덩어리만 여기로 보내 첫 소리를
+    앞당긴다. 목소리 품질은 클라우드가 낫기 때문에 나머지 문장은 그쪽으로 간다.
+    """
+    if os.name != "nt":
+        return None
+
+    tmp = None
+    try:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            # 기본 음성이 영어면 한국어를 이상하게 읽는다. 한국어 음성이 있으면 그걸 쓴다.
+            for token in voice.GetVoices():
+                if any(h in token.GetDescription().lower() for h in _KOREAN_VOICE_HINTS):
+                    voice.Voice = token
+                    break
+
+            fd, tmp = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            stream = win32com.client.Dispatch("SAPI.SpFileStream")
+            stream.Open(tmp, 3)  # 3 = 쓰기용으로 새로 만들기
+            voice.AudioOutputStream = stream
+            voice.Speak(text)
+            stream.Close()
+
+            return sf.read(tmp, dtype="float32")
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception as exc:
+        if DEBUG:
+            print("  (로컬 합성 실패 → 클라우드)", exc, flush=True)
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -386,12 +446,17 @@ class Jarvis:
     # 응답 전체를 받은 뒤에야 말을 시작하던 기존 방식보다 첫 소리까지가 훨씬 빠르다.
 
     def _fetcher(self, text_q: "queue.Queue[str | None]", audio_q: "queue.Queue") -> None:
+        first = True
         while True:
             text = text_q.get()
             if text is None:
                 audio_q.put(None)  # 재생 스레드도 종료시킨다
                 return
-            clip = self._tts_fetch(text)
+            # 첫 덩어리만 로컬에서 합성해 첫 소리를 앞당긴다. 실패하면 그냥 클라우드로.
+            clip = _tts_local(text) if (first and TTS_FIRST_LOCAL) else None
+            if clip is None:
+                clip = self._tts_fetch(text)
+            first = False
             if clip is not None:
                 audio_q.put(clip)
 
@@ -421,7 +486,10 @@ class Jarvis:
 
     def chat(self, text: str) -> str:
         ws = websocket.create_connection(WS_URL, timeout=120)
-        ws.send(json.dumps({"content": text}))
+        payload = {"content": text}
+        if DRIVE_MODE:
+            payload["mode"] = "drive"  # 백엔드가 답변을 두세 문장으로 줄인다
+        ws.send(json.dumps(payload))
         speak_q, player = self._start_player()
         reply = ""
         buf = ""
@@ -555,19 +623,35 @@ class Jarvis:
             wake_word = "헤이 자비스" if self.oww is not None else WAKE_WORDS[0]
             wake_hint = f"'{wake_word}'라고 부르거나 박수 두 번" if CLAP_ENABLE else f"'{wake_word}'라고 불러보세요"
             print(f"대기 중… {wake_hint}. (종료: Ctrl+C)", flush=True)
+            if DRIVE_MODE:
+                print("운전 모드: 답변을 짧게 합니다.", flush=True)
             self.hud("idle")
+            # 방금 답을 마쳤으면 잠깐은 깨우지 않고 이어 말할 수 있다(시리와 같은 방식).
+            follow_up = False
             while True:
-                self.wait_for_wake()
-                self.beep()
-                print("[깨어남] 듣고 있어요…", flush=True)
-                self.hud("listening")
-                # 깨어났음을 음성으로 알린다(미리 합성해둔 응답 → 즉시 재생).
-                self.ack()
-                pcm, spoke = self.record_utterance()
-                if not spoke:
-                    print("…못 들었어요. 다시 대기.", flush=True)
-                    self.hud("idle")
-                    continue
+                if follow_up:
+                    # 깨움 신호도 띵 소리도 없이 곧장 듣는다. 침묵하면 다시 대기로 돌아간다.
+                    pcm, spoke = self.record_utterance(
+                        max_seconds=CONV_TIMEOUT + 12, initial_silence=CONV_TIMEOUT
+                    )
+                    if not spoke:
+                        print("…이어지는 말 없음. 다시 대기.", flush=True)
+                        follow_up = False
+                        self.hud("idle")
+                        continue
+                else:
+                    self.wait_for_wake()
+                    self.beep()
+                    print("[깨어남] 듣고 있어요…", flush=True)
+                    self.hud("listening")
+                    # 깨어났음을 음성으로 알린다(미리 합성해둔 응답 → 즉시 재생).
+                    self.ack()
+                    pcm, spoke = self.record_utterance()
+                    if not spoke:
+                        print("…못 들었어요. 다시 대기.", flush=True)
+                        self.hud("idle")
+                        continue
+                follow_up = False  # 아래에서 답을 마쳤을 때만 다시 켠다
                 try:
                     text = self.stt(pcm)
                 except Exception as exc:
@@ -587,7 +671,12 @@ class Jarvis:
                     print("…백엔드 오류:", exc, flush=True)
                     self.say(reply)
                 print(f"자비스: {reply}", flush=True)
-                self.hud("idle")
+                if CONV_TIMEOUT > 0:
+                    follow_up = True
+                    print(f"(계속 말해도 됩니다 · {CONV_TIMEOUT:.0f}초)", flush=True)
+                    self.hud("listening")
+                else:
+                    self.hud("idle")
 
 
 def main() -> None:

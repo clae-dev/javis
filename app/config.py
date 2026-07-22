@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # gpt-4o-mini-transcribe 는 whisper-1 보다 응답이 빠르다. 호환 문제가 있으면
     # .env 에서 STT_MODEL=whisper-1 로 되돌릴 수 있다.
     stt_model: str = "gpt-4o-mini-transcribe"
+    # "openai"(기본) 또는 "local". local 은 faster-whisper 를 이 기계에서 돌린다 —
+    # 네트워크 왕복이 없어 차 안에서 유리하다. 실패 시 자동으로 클라우드로 넘어간다.
+    stt_engine: str = "openai"
+    stt_local_model: str = "small"  # tiny / base / small / medium / large-v3
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "alloy"
     # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 음성에 감정을 싣는다.
@@ -45,6 +49,14 @@ class Settings(BaseSettings):
     # Google
     google_credentials_path: str = "credentials/google.json"
     google_token_path: str = "credentials/token.json"
+
+    # Claude Code 연동 (음성 코딩). 여기 등록한 프로젝트만 열 수 있다.
+    # 형식: "이름=경로,이름=경로"  예) javis=C:\workspace\Javis
+    code_projects: str = ""
+    # claude CLI 에 넘길 모델. 별칭(opus/sonnet/haiku)이나 전체 이름.
+    # 응답이 느리면 sonnet 으로 낮춘다.
+    code_model: str = "opus"
+    code_sessions_path: str = "credentials/code_sessions.json"
 
     @property
     def has_openai(self) -> bool:

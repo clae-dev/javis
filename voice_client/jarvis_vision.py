@@ -20,11 +20,13 @@ pip 만으로 윈도우에 깔리고 모델도 작다(합쳐 40MB 남짓). 제�
 
 import argparse
 import base64
+import importlib
 import json
 import os
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -83,6 +85,11 @@ MODELS = {
         "face_recognition_sface_2021dec.onnx",
         "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
         "models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+    ),
+    "hands": (
+        "hand_landmarker.task",
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+        "hand_landmarker/float16/1/hand_landmarker.task",
     ),
 }
 
@@ -210,6 +217,20 @@ def classify_motion(dx: float, dy: float, move: float) -> str | None:
     return ("push_down" if dy > 0 else "pull_up") if abs(dy) > move else None
 
 
+def _mediapipe_tasks():
+    """(hand_landmarker, base_options, running_mode) 모듈.
+
+    `mediapipe.solutions` 는 1.0 에서 사라졌고, `from mediapipe.tasks.python import
+    vision` 은 1.0 의 패키지 __init__ 이 깨져 있어 안 된다. 깊은 경로로 직접
+    부르면 0.10 과 1.0 양쪽에서 다 된다.
+    """
+    return (
+        importlib.import_module("mediapipe.tasks.python.vision.hand_landmarker"),
+        importlib.import_module("mediapipe.tasks.python.core.base_options"),
+        importlib.import_module("mediapipe.tasks.python.vision.core.vision_task_running_mode"),
+    )
+
+
 class GestureEngine:
     """두 손 모션만 본다.
 
@@ -218,56 +239,88 @@ class GestureEngine:
     실제로 쓸 만하다.
     """
 
-    HISTORY = 10  # 약 0.33초
+    # 프레임 수가 아니라 시간으로 센다. 손 검출은 자주 깜빡여서(실측 882프레임 중
+    # 두 손이 잡힌 건 123프레임) 연속 프레임을 세면 창이 영영 안 찬다. 카메라
+    # 프레임레이트에 결과가 좌우되지도 않는다.
+    WINDOW = 0.5  # 이 시간 안의 변화량으로 판정한다
+    # 실측: 두 손이 잡히는 건 초당 7~8회. 0.5초 창에 평균 3.8개라 4를 요구하면
+    # 경계에 걸린다. 3으로 두면 검출이 나빠져도 버티고, 실측 데이터로 돌려 본
+    # 결과 발동 횟수는 4일 때와 같다.
+    MIN_SAMPLES = 3
+    GAP_TOLERANCE = 0.6  # 두 손이 이만큼 안 보이면 추적을 버린다(손을 내린 것)
     MOVE = 0.20  # 정규화 좌표 기준 변화량
     COOLDOWN = 1.0
+    FRAME_MS = 33  # VIDEO 모드가 요구하는 단조 증가 타임스탬프의 한 칸
 
     def __init__(self) -> None:
         import mediapipe as mp
 
+        hand_landmarker, base_options, running_mode = _mediapipe_tasks()
         self._mp = mp
-        self.hands = mp.solutions.hands.Hands(
-            max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.5
+        self.landmarker = hand_landmarker.HandLandmarker.create_from_options(
+            hand_landmarker.HandLandmarkerOptions(
+                base_options=base_options.BaseOptions(
+                    model_asset_path=str(ensure_model("hands"))
+                ),
+                running_mode=running_mode.VisionTaskRunningMode.VIDEO,
+                num_hands=2,
+            )
         )
-        self.gap: list[float] = []
-        self.height: list[float] = []
+        self.connections = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
+        self.frames = 0
+        # (시각, 두 손 간격, 두 손 평균 높이)
+        self.samples: deque[tuple[float, float, float]] = deque()
+        self.last_seen = 0.0
         self.last_fired = 0.0
+        # 미리보기에서 그리려고 들고 있는다. 판정에는 쓰지 않는다.
+        self.last_marks: list = []
 
     @staticmethod
     def available() -> bool:
+        """import 만 확인하면 안 된다 — mediapipe 1.0 은 설치돼 있어도 옛 API 가 없다."""
         try:
             import mediapipe  # noqa: F401
+
+            _mediapipe_tasks()
         except Exception:
             return False
         return True
 
     def feed(self, frame) -> str | None:
-        result = self.hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        marks = result.multi_hand_landmarks or []
-        if len(marks) != 2:
-            self.gap.clear()
-            self.height.clear()
-            return None
-
-        wrists = [hand.landmark[0] for hand in marks]
-        self.gap.append(abs(wrists[0].x - wrists[1].x))
-        self.height.append((wrists[0].y + wrists[1].y) / 2)
-        if len(self.gap) < self.HISTORY:
-            return None
-        self.gap = self.gap[-self.HISTORY :]
-        self.height = self.height[-self.HISTORY :]
-
-        now = time.time()
-        if now - self.last_fired < self.COOLDOWN:
-            return None
-
-        name = classify_motion(
-            self.gap[-1] - self.gap[0], self.height[-1] - self.height[0], self.MOVE
+        image = self._mp.Image(
+            image_format=self._mp.ImageFormat.SRGB,
+            data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
         )
+        self.frames += 1
+        result = self.landmarker.detect_for_video(image, self.frames * self.FRAME_MS)
+
+        now = time.monotonic()
+        marks = result.hand_landmarks or []
+        self.last_marks = marks
+        if len(marks) != 2:
+            # 잠깐 놓친 것과 손을 내린 것을 구분한다. 매번 지우면 깜빡임 때문에
+            # 표본이 절대 안 모인다.
+            if now - self.last_seen > self.GAP_TOLERANCE:
+                self.samples.clear()
+            return None
+
+        self.last_seen = now
+        wrists = [hand[0] for hand in marks]
+        self.samples.append(
+            (now, abs(wrists[0].x - wrists[1].x), (wrists[0].y + wrists[1].y) / 2)
+        )
+        cutoff = now - self.WINDOW
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+        if len(self.samples) < self.MIN_SAMPLES or now - self.last_fired < self.COOLDOWN:
+            return None
+
+        first, last = self.samples[0], self.samples[-1]
+        name = classify_motion(last[1] - first[1], last[2] - first[2], self.MOVE)
         if name:
             self.last_fired = now
-            self.gap.clear()
-            self.height.clear()
+            self.samples.clear()
         return name
 
 
@@ -312,6 +365,7 @@ class VisionDaemon:
         self.running = True
         self.last_state: tuple[tuple[str, ...], int] = ((), 0)
         self.last_sent = 0.0
+        self.last_gesture = ""
 
     # --- 통신 ---
 
@@ -376,6 +430,7 @@ class VisionDaemon:
 
                 if self.gestures and (gesture := self.gestures.feed(frame)):
                     print(f"제스처: {gesture}")
+                    self.last_gesture = gesture
                     self.send({"type": "gesture", "name": gesture})
                     if self.control:
                         press_media(gesture)
@@ -408,14 +463,37 @@ class VisionDaemon:
             print(f"보임: {', '.join(names)}" + (f" (+모르는 사람 {unknown})" if unknown else ""))
 
     def _draw(self, frame) -> bool:
-        """--test 용 미리보기. 창을 닫거나 q 를 누르면 False."""
+        """--test 용 미리보기. 창을 닫거나 q 를 누르면 False.
+
+        얼굴은 노란 상자, 손은 초록 선. 눈으로 봐야 아는 것들이 있다 — 손이
+        잡히긴 하는지, 얼굴을 엉뚱한 데서 찾는 건 아닌지.
+        """
         shown = frame.copy()
+        height, width = shown.shape[:2]
+
         for face in self.boxes:
             x, y, w, h = (int(v) for v in face[:4])
             cv2.rectangle(shown, (x, y), (x + w, y + h), (0, 220, 255), 2)
-        label = ", ".join(self.last_state[0]) or "(모르는 얼굴)" if self.boxes else ""
-        if label:
-            cv2.putText(shown, label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2)
+
+        if self.gestures:
+            for hand in self.gestures.last_marks:
+                points = [(int(p.x * width), int(p.y * height)) for p in hand]
+                for link in self.gestures.connections:
+                    cv2.line(shown, points[link.start], points[link.end], (0, 255, 0), 2)
+                for point in points:
+                    cv2.circle(shown, point, 4, (0, 255, 0), -1)
+
+        lines = []
+        if self.boxes:
+            lines.append(", ".join(self.last_state[0]) or "(모르는 얼굴)")
+        if self.gestures:
+            hands = len(self.gestures.last_marks)
+            lines.append(f"hands {hands}" + (f" | {self.last_gesture}" if self.last_gesture else ""))
+        for i, line in enumerate(lines):
+            cv2.putText(
+                shown, line, (12, 32 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2
+            )
+
         cv2.imshow("javis vision", shown)
         return cv2.waitKey(1) & 0xFF != ord("q")
 

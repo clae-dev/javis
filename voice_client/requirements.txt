@@ -12,6 +12,6 @@ pywin32>=306
 # 비전 데몬(jarvis_vision.py) 전용. 음성만 쓸 거면 없어도 된다.
 # 얼굴은 OpenCV 의 YuNet + SFace 로 본다 — dlib·insightface 와 달리 pip 만으로 깔린다.
 opencv-python>=4.9
-# 제스처(두 손 모션). 파이썬 버전에 맞는 휠이 없으면 건너뛰어도 되고,
-# 그러면 데몬이 제스처만 끄고 나머지는 그대로 돈다.
-mediapipe>=0.10 ; python_version < "3.13"
+# 제스처(두 손 모션). Tasks API 를 쓰므로 0.10 과 1.0 양쪽에서 동작한다.
+# 휠이 없는 파이썬 버전이면 건너뛰어도 되고, 그러면 제스처만 꺼지고 나머지는 그대로 돈다.
+mediapipe>=0.10

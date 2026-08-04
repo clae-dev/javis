@@ -27,6 +27,7 @@ from app.tools.notes import (
 from app.tools.reminders import complete_reminder, create_reminder, list_reminders
 from app.tools.schedules import create_schedule, delete_schedule, list_schedules
 from app.tools.search import web_search
+from app.tools.vision import look, who_is_here
 from app.tools.youtube import get_video_stats, list_channel_videos, search_youtube
 
 TOOLS = [
@@ -64,6 +65,8 @@ TOOLS = [
     search_youtube,
     get_video_stats,
     list_channel_videos,
+    look,
+    who_is_here,
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}

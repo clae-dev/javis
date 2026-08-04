@@ -44,6 +44,13 @@ body { transition: background .6s ease; }
   transition: color .6s ease, text-shadow .6s ease;
 }
 .conn { font-size: 12px; letter-spacing: .15em; color: #5c7686; }
+/* 카메라가 알아본 사람. 비어 있을 땐 자리도 차지하지 않는다. */
+.presence {
+  margin-left: auto; margin-right: 18px;
+  font-size: 12px; letter-spacing: .1em; color: var(--c);
+  opacity: .75; transition: opacity .4s ease;
+}
+.presence:empty { opacity: 0; }
 
 .stage {
   position: fixed; inset: 0;

@@ -75,8 +75,17 @@ class Settings(BaseSettings):
     # 유튜브 데이터 API. 콘솔에서 API 키만 발급하면 된다(구글 OAuth 스코프는 안 건드린다).
     youtube_api_key: str = ""
 
+    # 세컨브레인 — 색인할 노트 폴더 (옵시디언 vault 든 그냥 폴더든).
+    # 비우면 색인·검색 도구가 안내 문구만 돌려주고 나머지는 정상 동작한다.
+    notes_path: str = ""
+    notes_extensions: str = ".md,.txt,.pdf"
+    notes_index_minutes: int = 10  # 증분 색인 주기
+    notes_chunk_chars: int = 1200  # 조각 하나의 최대 길이
+
     # 도구가 남기는 캡처물(폰 스크린샷 등) 보관 위치.
     captures_path: str = "captures"
+    # 노트를 읽어 만든 음성 파일 보관 위치.
+    podcasts_path: str = "podcasts"
 
     # Claude Code 연동 (음성 코딩). 여기 등록한 프로젝트만 열 수 있다.
     # 형식: "이름=경로,이름=경로"  예) javis=C:\workspace\Javis

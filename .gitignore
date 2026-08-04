@@ -14,6 +14,8 @@ credentials/browser/
 
 # 폰 스크린샷 등 도구가 남기는 캡처물
 captures/
+# 노트를 읽어 만든 음성 파일
+podcasts/
 
 voice_client/models/
 

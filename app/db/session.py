@@ -43,6 +43,19 @@ async def init_db() -> None:
             )
         )
 
+    # 노트 조각도 기억과 같은 방식으로 벡터 검색을 탄다. 노트는 대화보다 훨씬 빨리
+    # 쌓이므로(문서 하나가 조각 수십 개) 인덱스가 없으면 금방 느려진다.
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_document_chunks_embedding_hnsw "
+                    "ON document_chunks USING hnsw (embedding vector_l2_ops)"
+                )
+            )
+    except Exception as exc:
+        log.warning("노트 HNSW 인덱스 생성 실패(검색은 풀스캔으로 동작): %s", exc)
+
     # 감사로그는 시간순 조회와 종류별 통계 조회가 빈번하다. 인덱스가 없으면 로그가
     # 쌓일수록 선형으로 느려진다.
     async with engine.begin() as conn:

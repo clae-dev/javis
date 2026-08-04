@@ -26,6 +26,8 @@ async def lifespan(app: FastAPI):
         checkpointer = await make_checkpointer(stack)
         runtime.graph = build_graph(checkpointer)
         scheduler.start()
+        if not settings.javis_token:
+            log.warning("JAVIS_TOKEN 이 비어 있습니다 — 인증 없이 열립니다. 이 기계 밖에 노출하지 마세요.")
         log.info("%s 준비 완료 (OpenAI=%s)", settings.assistant_name, settings.has_openai)
         try:
             yield

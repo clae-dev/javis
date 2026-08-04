@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     owner_name: str = "창래"
     timezone: str = "Asia/Seoul"
 
+    # 접속 토큰. 비우면 인증 없음(로컬 단독 실행).
+    # 이 기계 밖에서 붙을 거라면 — 테일스케일 같은 사설망 뒤라도 — 반드시 채운다.
+    javis_token: str = ""
+
     # 동작 토글
     use_postgres_checkpointer: bool = True
     enable_scheduler: bool = True

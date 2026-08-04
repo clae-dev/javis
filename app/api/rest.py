@@ -1,11 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
+from app.api.deps import require_token
 from app.config import settings
 from app.db.models import MemoryItem
 from app.db.session import async_session
 
 router = APIRouter()
+
+# /health 는 살아있는지만 보는 용도라 토큰 없이 열어 둔다.
 
 
 @router.get("/health")
@@ -13,7 +16,7 @@ async def health() -> dict:
     return {"status": "ok", "assistant": settings.assistant_name, "openai": settings.has_openai}
 
 
-@router.get("/memories")
+@router.get("/memories", dependencies=[Depends(require_token)])
 async def memories(limit: int = 50) -> list[dict]:
     """저장된 장기 기억을 최근순으로 본다. 디버깅·점검용."""
     async with async_session() as session:

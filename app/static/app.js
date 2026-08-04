@@ -26,6 +26,23 @@ let currentBot = null;
 let currentText = "";
 let voiceOutput = localStorage.getItem("javis_voice_out") === "1";
 
+// --- 접속 토큰 ---
+// 서버에 JAVIS_TOKEN 이 설정돼 있으면 같은 값을 요구한다. 로컬 단독 실행이면 비어 있어도 붙는다.
+
+let authToken = localStorage.getItem("javis_token") || "";
+
+function askToken(message) {
+  const t = window.prompt(message || "자비스 접속 토큰");
+  authToken = (t || "").trim();
+  if (authToken) localStorage.setItem("javis_token", authToken);
+  else localStorage.removeItem("javis_token");
+  return authToken;
+}
+
+function authHeaders(extra = {}) {
+  return authToken ? { ...extra, "X-Javis-Token": authToken } : extra;
+}
+
 // --- UI helpers ---
 
 function add(cls, text = "") {
@@ -49,8 +66,21 @@ setVoiceOutUI();
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/chat?thread_id=${threadId}`);
-  ws.onopen = () => { statusEl.textContent = "연결됨"; sendBtn.disabled = false; };
-  ws.onclose = () => { statusEl.textContent = "연결 끊김 — 재연결 중…"; setTimeout(connect, 2000); };
+  ws.onopen = () => {
+    // 토큰은 URL 이 아니라 첫 프레임으로 보낸다 (접속 로그에 남지 않게).
+    if (authToken) ws.send(JSON.stringify({ token: authToken }));
+    statusEl.textContent = "연결됨";
+    sendBtn.disabled = false;
+  };
+  ws.onclose = (ev) => {
+    if (ev.code === 1008) {
+      statusEl.textContent = "인증 실패";
+      if (askToken("토큰이 올바르지 않습니다. 다시 입력하세요")) connect();
+      return;
+    }
+    statusEl.textContent = "연결 끊김 — 재연결 중…";
+    setTimeout(connect, 2000);
+  };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
 }
 
@@ -169,12 +199,15 @@ micBtn.addEventListener("click", async () => {
   }
 });
 
-async function transcribe(blob) {
+async function transcribe(blob, retried = false) {
   note("🎧 음성 인식 중…");
   try {
     const fd = new FormData();
     fd.append("file", blob, "audio.webm");
-    const res = await fetch("/voice/stt", { method: "POST", body: fd });
+    const res = await fetch("/voice/stt", { method: "POST", body: fd, headers: authHeaders() });
+    if (res.status === 401 && !retried && askToken("토큰이 필요합니다")) {
+      return transcribe(blob, true);
+    }
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     const { text } = await res.json();
     if (text && text.trim()) sendText(text.trim());
@@ -280,7 +313,7 @@ async function pumpFetch() {
       try {
         const res = await fetch("/voice/tts", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ text }),
         });
         if (!res.ok) continue;

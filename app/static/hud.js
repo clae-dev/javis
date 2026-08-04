@@ -153,11 +153,15 @@ function draw() {
 draw();
 
 // --- WebSocket ---
+// 채팅 화면과 같은 토큰을 쓴다. 서버에 JAVIS_TOKEN 이 없으면 빈 값이어도 붙는다.
+let authToken = localStorage.getItem("javis_token") || "";
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/hud`);
   let ping;
   ws.onopen = () => {
+    if (authToken) ws.send(JSON.stringify({ token: authToken }));
     connEl.textContent = "● ONLINE";
     ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 25000);
   };
@@ -167,10 +171,19 @@ function connect() {
       if (m.state) setState(m.state, m.text);
     } catch {}
   };
-  ws.onclose = () => {
-    connEl.textContent = "○ 재연결 중…";
+  ws.onclose = (ev) => {
     clearInterval(ping);
     setState("idle");
+    if (ev.code === 1008) {
+      connEl.textContent = "○ 인증 실패";
+      const t = window.prompt("자비스 접속 토큰");
+      authToken = (t || "").trim();
+      if (!authToken) return;
+      localStorage.setItem("javis_token", authToken);
+      connect();
+      return;
+    }
+    connEl.textContent = "○ 재연결 중…";
     setTimeout(connect, 1500);
   };
 }

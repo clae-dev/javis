@@ -56,6 +56,10 @@ _load_dotenv()
 
 BACKEND = os.environ.get("JAVIS_BACKEND", "http://localhost:8000")
 WS_URL = BACKEND.replace("https", "wss").replace("http", "ws") + "/ws/chat?thread_id=voice"
+
+# 백엔드에 JAVIS_TOKEN 이 설정돼 있으면 같은 값을 여기도 넣는다. 비어 있으면 인증 없음.
+TOKEN = os.environ.get("JAVIS_TOKEN", "").strip()
+AUTH_HEADERS = {"X-Javis-Token": TOKEN} if TOKEN else {}
 SAMPLE_RATE = 16000
 BLOCK = 4000  # 0.25s 단위
 
@@ -434,7 +438,7 @@ class Jarvis:
 
     def stt(self, pcm: bytes) -> str:
         files = {"file": ("cmd.wav", pcm_to_wav(pcm), "audio/wav")}
-        r = requests.post(f"{BACKEND}/voice/stt", files=files, timeout=60)
+        r = requests.post(f"{BACKEND}/voice/stt", files=files, headers=AUTH_HEADERS, timeout=60)
         r.raise_for_status()
         return r.json().get("text", "").strip()
 
@@ -486,6 +490,8 @@ class Jarvis:
 
     def chat(self, text: str) -> str:
         ws = websocket.create_connection(WS_URL, timeout=120)
+        if TOKEN:
+            ws.send(json.dumps({"token": TOKEN}))  # 첫 프레임이 인증
         payload = {"content": text}
         if DRIVE_MODE:
             payload["mode"] = "drive"  # 백엔드가 답변을 두세 문장으로 줄인다
@@ -556,7 +562,10 @@ class Jarvis:
         """문장 하나를 오디오로 합성. (audio, sr) 또는 실패 시 None."""
         try:
             r = requests.post(
-                f"{BACKEND}/voice/tts", json={"text": text, "format": "wav"}, timeout=120
+                f"{BACKEND}/voice/tts",
+                json={"text": text, "format": "wav"},
+                headers=AUTH_HEADERS,
+                timeout=120,
             )
             if r.status_code != 200:
                 print("  (음성 합성 실패)", r.text[:200])
@@ -604,7 +613,12 @@ class Jarvis:
     def hud(self, state: str, text: str = "") -> None:
         """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort."""
         try:
-            requests.post(f"{BACKEND}/hud/event", json={"state": state, "text": text}, timeout=2)
+            requests.post(
+                f"{BACKEND}/hud/event",
+                json={"state": state, "text": text},
+                headers=AUTH_HEADERS,
+                timeout=2,
+            )
         except Exception:
             pass
 

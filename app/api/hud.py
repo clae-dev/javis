@@ -4,8 +4,9 @@
 WebSocket 으로 실시간 브로드캐스트한다.
 """
 
-from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Depends, WebSocket, WebSocketDisconnect
 
+from app.api.deps import authenticate_ws, require_token
 from app.api.notifications import ConnectionManager
 
 router = APIRouter()
@@ -15,6 +16,8 @@ hud_manager = ConnectionManager()
 @router.websocket("/ws/hud")
 async def hud_ws(ws: WebSocket) -> None:
     await ws.accept()
+    if not await authenticate_ws(ws):
+        return
     hud_manager.add(ws)
     try:
         while True:
@@ -25,7 +28,7 @@ async def hud_ws(ws: WebSocket) -> None:
         hud_manager.remove(ws)
 
 
-@router.post("/hud/event")
+@router.post("/hud/event", dependencies=[Depends(require_token)])
 async def hud_event(payload: dict = Body(...)) -> dict:
     """음성 데몬이 호출. {state, text} 를 모든 HUD 화면에 흘린다."""
     await hud_manager.broadcast(payload or {})

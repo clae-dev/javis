@@ -87,6 +87,22 @@ class DocumentChunk(Base):
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dim))
 
 
+class KnownFace(Base):
+    """자비스가 알아보는 얼굴.
+
+    임베딩 계산과 매칭은 카메라가 달린 기계(비전 데몬)에서 한다. 서버는 보관하고
+    나눠 주기만 한다 — 아이 얼굴 같은 민감정보를 클라우드로 보내지 않기 위해서다.
+    """
+
+    __tablename__ = "known_faces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    relation: Mapped[str] = mapped_column(String(64), default="")
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.face_embedding_dim))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ScheduledJob(Base):
     """사용자가 말로 걸어 둔 정기 작업.
 

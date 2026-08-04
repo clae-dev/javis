@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from app import scheduler
 from app.agent.graph import build_graph, make_checkpointer
 from app.agent.runtime import runtime
-from app.api import hud, rest, voice, ws
+from app.api import hud, rest, vision, voice, ws
 from app.config import settings
 from app.db.session import init_db
 from app.tools import browser
@@ -44,6 +44,7 @@ app.include_router(rest.router)
 app.include_router(voice.router)
 app.include_router(ws.router)
 app.include_router(hud.router)
+app.include_router(vision.router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # 유튜브 데이터 API. 콘솔에서 API 키만 발급하면 된다(구글 OAuth 스코프는 안 건드린다).
     youtube_api_key: str = ""
 
+    # 카메라. 얼굴 임베딩 차원은 데몬이 쓰는 모델에 맞춘다 — OpenCV SFace 는 128.
+    # 이 값을 바꾸면 known_faces 테이블을 지우고 다시 등록해야 한다.
+    face_embedding_dim: int = 128
+    # 사물·장면 설명에 쓸 모델. 비우면 llm_model 을 그대로 쓴다(gpt-4o 계열은 이미지 입력 지원).
+    vision_model: str = ""
+
     # 세컨브레인 — 색인할 노트 폴더 (옵시디언 vault 든 그냥 폴더든).
     # 비우면 색인·검색 도구가 안내 문구만 돌려주고 나머지는 정상 동작한다.
     notes_path: str = ""

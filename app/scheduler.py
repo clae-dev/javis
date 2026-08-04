@@ -12,7 +12,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -61,6 +61,16 @@ async def _morning_briefing() -> None:
             await manager.broadcast({"type": "proactive", "content": f"☀️ 오늘 일정\n{lines}"})
     except Exception as exc:
         log.debug("아침 브리핑 건너뜀: %s", exc)
+
+
+async def _index_notes() -> None:
+    """노트 폴더 증분 색인. 바뀐 게 없으면 stat 만 돌고 끝난다."""
+    try:
+        from app.memory.indexer import reindex
+
+        log.info("노트 색인: %s", await reindex())
+    except Exception as exc:
+        log.warning("노트 색인 실패(무시): %s", exc)
 
 
 # --- 사용자 정기 작업 ---
@@ -190,6 +200,15 @@ async def start() -> None:
     _scheduler = AsyncIOScheduler(timezone=settings.timezone)
     _scheduler.add_job(_check_due_reminders, "interval", seconds=60, id="due_reminders")
     _scheduler.add_job(_morning_briefing, "cron", hour=8, minute=0, id="morning_briefing")
+    if settings.notes_path:
+        # 기동 직후 한 번 훑고(밖에서 고친 노트를 바로 반영) 이후 주기적으로 돈다.
+        _scheduler.add_job(
+            _index_notes,
+            "interval",
+            minutes=settings.notes_index_minutes,
+            id="index_notes",
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
+        )
     _scheduler.start()
     try:
         await _load_jobs()

@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from app.api.deps import require_token
@@ -32,3 +35,16 @@ async def memories(limit: int = 50) -> list[dict]:
             }
             for m in rows.scalars()
         ]
+
+
+@router.get("/podcast/{name}", dependencies=[Depends(require_token)])
+async def podcast(name: str) -> FileResponse:
+    """narrate_notes 가 만든 음성 파일.
+
+    개인 노트를 읽어 만든 것이라 정적 파일로 열지 않고 토큰 뒤에 둔다.
+    """
+    safe = Path(name).name  # 경로 조각을 잘라낸다
+    path = Path(settings.podcasts_path) / safe
+    if safe != name or path.suffix.lower() != ".mp3" or not path.is_file():
+        raise HTTPException(404, "파일을 찾을 수 없습니다.")
+    return FileResponse(path, media_type="audio/mpeg", filename=safe)

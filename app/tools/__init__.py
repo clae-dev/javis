@@ -17,6 +17,13 @@ from app.tools.calendar import create_event, get_upcoming_events
 from app.tools.code import ask_project, edit_project
 from app.tools.gmail import list_recent_emails, send_email
 from app.tools.hue import get_hue_lights, set_hue_light
+from app.tools.notes import (
+    append_note,
+    narrate_notes,
+    read_note,
+    reindex_notes,
+    search_notes,
+)
 from app.tools.reminders import complete_reminder, create_reminder, list_reminders
 from app.tools.schedules import create_schedule, delete_schedule, list_schedules
 from app.tools.search import web_search
@@ -27,6 +34,11 @@ TOOLS = [
     web_search,
     remember,
     recall,
+    search_notes,
+    read_note,
+    append_note,
+    reindex_notes,
+    narrate_notes,
     create_reminder,
     list_reminders,
     complete_reminder,
@@ -63,6 +75,7 @@ WRITE_TOOLS = {
     "edit_project",
     "set_hue_light",
     "send_sms",
+    "append_note",
     "browser_act",
     # 한 번 걸면 계속 도는 규칙이라, 만들고 지울 때 확인을 거친다.
     "create_schedule",

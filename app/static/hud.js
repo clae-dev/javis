@@ -4,6 +4,7 @@ const statusEl = document.getElementById("status");
 const userLine = document.getElementById("userLine");
 const replyLine = document.getElementById("replyLine");
 const connEl = document.getElementById("conn");
+const presenceEl = document.getElementById("presence");
 const fsBtn = document.getElementById("fsBtn");
 
 const PALETTE = {
@@ -152,25 +153,62 @@ function draw() {
 }
 draw();
 
+// --- 카메라에 누가 보이는지 ---
+//
+// 얼굴 상자를 그리려면 영상이 있어야 하는데 HUD 에는 영상이 없다. 대신 알아본
+// 이름만 상단에 띄운다. 카메라 화면을 이 페이지로 끌어오는 건 대역폭도, 사생활도
+// 값이 비싸서 하지 않는다.
+
+let presenceTimer = null;
+
+function showPresence(names) {
+  clearTimeout(presenceTimer);
+  presenceEl.textContent = names.length ? `👁 ${names.join(", ")}` : "";
+}
+
+function flashPresence(text) {
+  const previous = presenceEl.textContent;
+  presenceEl.textContent = text;
+  clearTimeout(presenceTimer);
+  presenceTimer = setTimeout(() => (presenceEl.textContent = previous), 1500);
+}
+
 // --- WebSocket ---
+// 채팅 화면과 같은 토큰을 쓴다. 서버에 JAVIS_TOKEN 이 없으면 빈 값이어도 붙는다.
+let authToken = localStorage.getItem("javis_token") || "";
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/hud`);
   let ping;
   ws.onopen = () => {
+    if (authToken) ws.send(JSON.stringify({ token: authToken }));
     connEl.textContent = "● ONLINE";
     ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 25000);
   };
   ws.onmessage = (ev) => {
     try {
       const m = JSON.parse(ev.data);
+      // 카메라 소식은 아크리액터 상태를 건드리지 않는다. 대화 중에 말하다 말고
+      // idle 로 튀면 안 되니, 상단에 따로 표시만 한다.
+      if (m.state === "vision") return showPresence(m.faces || []);
+      if (m.state === "gesture") return flashPresence(`✋ ${m.text || ""}`);
       if (m.state) setState(m.state, m.text);
     } catch {}
   };
-  ws.onclose = () => {
-    connEl.textContent = "○ 재연결 중…";
+  ws.onclose = (ev) => {
     clearInterval(ping);
     setState("idle");
+    if (ev.code === 1008) {
+      connEl.textContent = "○ 인증 실패";
+      const t = window.prompt("자비스 접속 토큰");
+      authToken = (t || "").trim();
+      if (!authToken) return;
+      localStorage.setItem("javis_token", authToken);
+      connect();
+      return;
+    }
+    connEl.textContent = "○ 재연결 중…";
     setTimeout(connect, 1500);
   };
 }

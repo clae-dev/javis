@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessageChunk, HumanMessage
 from langgraph.types import Command
 
 from app.agent.runtime import runtime
+from app.api.deps import authenticate_ws
 from app.api.notifications import manager
 from app.config import settings
 
@@ -52,6 +53,8 @@ async def _stream(ws: WebSocket, payload, config) -> bool:
 @router.websocket("/ws/chat")
 async def chat_ws(ws: WebSocket) -> None:
     await ws.accept()
+    if not await authenticate_ws(ws):
+        return
     manager.add(ws)
     thread_id = ws.query_params.get("thread_id", "default")
     config = {"configurable": {"thread_id": thread_id}}

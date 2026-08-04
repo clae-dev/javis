@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Body, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from app.api.deps import require_token
 from app.config import settings
 from app.voice import stt, tts
 
-router = APIRouter(prefix="/voice")
+router = APIRouter(prefix="/voice", dependencies=[Depends(require_token)])
 
 _NO_KEY = "OPENAI_API_KEY 가 설정되지 않아 음성 기능을 쓸 수 없습니다."
 

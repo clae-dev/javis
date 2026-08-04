@@ -166,13 +166,18 @@ async def vision_ws(ws: WebSocket) -> None:
 # --- 등록된 얼굴 ---
 
 
+def _floats(vector) -> list[float]:
+    """pgvector 는 numpy 배열을 돌려준다. numpy.float32 는 JSON 으로 못 나간다."""
+    return [float(v) for v in vector]
+
+
 @router.get("/vision/faces", dependencies=[Depends(require_token)])
 async def list_faces() -> list[dict]:
     """데몬이 부팅 때 받아 가는 목록. 매칭은 데몬이 로컬에서 한다."""
     async with async_session() as session:
         rows = (await session.execute(select(KnownFace).order_by(KnownFace.name))).scalars().all()
     return [
-        {"name": f.name, "relation": f.relation, "embedding": list(f.embedding)} for f in rows
+        {"name": f.name, "relation": f.relation, "embedding": _floats(f.embedding)} for f in rows
     ]
 
 

@@ -119,6 +119,21 @@ def test_valid_frame_decodes():
     assert vision._resolve_frame(payload) == b"\xff\xd8jpeg"
 
 
+# --- 등록된 얼굴 직렬화 ---
+
+
+def test_embeddings_serialize_as_plain_floats():
+    """pgvector 는 numpy 배열을 돌려준다. numpy.float32 는 JSON 으로 못 나가고,
+    그대로 두면 목록 조회가 500 으로 죽는다 — 데몬이 얼굴을 하나도 못 받는다."""
+    import json
+
+    np = pytest.importorskip("numpy")
+    values = vision._floats(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    assert all(type(v) is float for v in values)
+    json.dumps(values)  # 여기서 터지면 엔드포인트도 터진다
+
+
 # --- 누가 보이는지 ---
 
 

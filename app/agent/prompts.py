@@ -1,3 +1,11 @@
+"""시스템 프롬프트.
+
+프롬프트 캐싱은 접두사 매칭이라, 앞쪽이 한 바이트라도 달라지면 그 뒤가 전부 무효가 된다.
+그래서 매 턴 바뀌는 값(시각·기분·기억)은 앞에 두지 않고 _변하는_ 꼬리로 몰아 붙인다.
+_고정_ 부분은 같은 입력이면 항상 같은 바이트를 내야 한다 — 여기에 시각 같은 걸 끼워 넣으면
+캐시가 통째로 죽는다.
+"""
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -5,15 +13,10 @@ from app.agent.state import JarvisState
 from app.config import settings
 from app.tools.code import project_names
 
-def build_system_prompt(state: JarvisState) -> str:
-    now = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d %H:%M (%A)")
-    profile = state.get("user_profile") or {}
-    owner = profile.get("name", settings.owner_name)
-    summary = (profile.get("summary") or "").strip()
-    mood = (state.get("mood") or "").strip()
 
+def _stable(owner: str) -> str:
+    """턴이 바뀌어도 그대로인 부분. 캐시가 걸리는 구간이다."""
     base = f"""너는 '{settings.assistant_name}', {owner} 님의 개인 비서이자 곁을 지키는 동료다.
-지금 시각: {now}
 
 [성격]
 - 따뜻하고 눈치가 빠르다. {owner} 님의 말투와 기분에 온도를 맞춘다.
@@ -56,29 +59,43 @@ def build_system_prompt(state: JarvisState) -> str:
             " 간추린다."
         ).replace("{owner}", owner)
 
+    return base
+
+
+def build_system_prompt(state: JarvisState) -> str:
+    profile = state.get("user_profile") or {}
+    owner = profile.get("name", settings.owner_name)
+    summary = (profile.get("summary") or "").strip()
+    mood = (state.get("mood") or "").strip()
+
+    parts = [_stable(owner)]
+
+    # 여기부터가 매 턴 바뀌는 꼬리. 캐시 경계 뒤라 앞부분 재사용을 깨지 않는다.
+    now = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d %H:%M (%A)")
+    parts.append(f"\n\n[지금 시각] {now}")
+
     if summary:
-        base += f"\n\n[{owner} 님에 대해 내가 알고 있는 것]\n{summary}"
+        parts.append(f"\n\n[{owner} 님에 대해 내가 알고 있는 것]\n{summary}")
 
     if mood and mood != "중립":
-        base += (
+        parts.append(
             f"\n\n[지금 {owner} 님 상태] {mood}\n"
             "이 감정을 헤아려서 반응해라. 형식적인 위로가 아니라 진심으로, 다만 과하지 않게."
         )
 
     if state.get("mode") == "drive":
-        base += (
+        parts.append(
             "\n\n[지금 운전 중]\n"
             "화면을 볼 수 없다. 두세 문장으로 짧게, 말로만 전달해라. 목록·코드·URL·파일 경로를"
             " 읊지 말고, 코드 작업은 무엇이 바뀌었는지 한 줄로만 말해라. 더 듣고 싶어 하면"
             " 그때 이어서 설명한다."
         )
 
-    context = state.get("retrieved_context") or []
-    if context:
+    if context := (state.get("retrieved_context") or []):
         joined = "\n".join(f"- {c}" for c in context)
-        base += f"\n\n[관련 기억]\n{joined}"
+        parts.append(f"\n\n[관련 기억]\n{joined}")
 
-    return base
+    return "".join(parts)
 
 
 REFLECT_PROMPT = """방금 오간 대화를 돌아보고 두 가지를 낸다.

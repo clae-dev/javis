@@ -17,6 +17,7 @@ from app.tools.calendar import create_event, get_upcoming_events
 from app.tools.code import ask_project, edit_project
 from app.tools.gmail import list_recent_emails, send_email
 from app.tools.hue import get_hue_lights, set_hue_light
+from app.tools.maps import get_directions, search_place
 from app.tools.notes import (
     append_note,
     narrate_notes,
@@ -67,6 +68,8 @@ TOOLS = [
     list_channel_videos,
     look,
     who_is_here,
+    search_place,
+    get_directions,
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}

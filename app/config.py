@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     # 유튜브 데이터 API. 콘솔에서 API 키만 발급하면 된다(구글 OAuth 스코프는 안 건드린다).
     youtube_api_key: str = ""
 
+    # 카카오 REST API 키 하나로 장소 검색(Local)과 길찾기(Mobility) 를 같이 쓴다.
+    kakao_rest_api_key: str = ""
+    # 출발지를 안 밝혔을 때의 기본값. "집에서 공항까지" 같은 말이 되게 한다.
+    home_address: str = ""
+
     # 카메라. 얼굴 임베딩 차원은 데몬이 쓰는 모델에 맞춘다 — OpenCV SFace 는 128.
     # 이 값을 바꾸면 known_faces 테이블을 지우고 다시 등록해야 한다.
     face_embedding_dim: int = 128

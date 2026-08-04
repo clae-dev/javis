@@ -18,6 +18,8 @@
 - **브라우저**: 자바스크립트로 그려지는 페이지를 실제로 열어 읽고, 목록을 긁고, 필요하면 조작한다(조작은 확인 필요).
 - **유튜브**: 영상 검색, 조회수·좋아요 같은 지표, 채널 최근 영상.
 - **세컨브레인**: 옵시디언 vault나 문서 폴더를 색인해 내가 쓴 글에서 찾아준다. 노트에 덧쓰기도 하고(확인 필요), 주제를 정해 주면 엮어서 음성 파일로 만들어 준다.
+- **지도**: 장소 검색, 차로 몇 분 걸리는지·통행료는 얼마인지. 폰으로 바로 길안내를 띄울 수 있다.
+- **카메라**: 지금 뭐가 보이는지 묻고, 등록해 둔 얼굴을 알아본다. 두 손 제스처도 인식한다.
 - **음성**: 마이크로 말하면 Whisper로 받아쓰고, 응답을 TTS로 읽어준다. 받아쓰기는 로컬로도 돌릴 수 있다.
 - **능동 알림**: 마감된 리마인더, 아침 일정 브리핑을 먼저 알려준다.
 - **정기 작업**: "매일 아침 새 매물 확인해줘" 처럼 걸어 두면, 그 시각에 실제로 알아보고 결과를 알려준다.
@@ -33,9 +35,11 @@
    LangGraph Agent ── PostgreSQL + pgvector (장기 기억 / 대화 체크포인트)
         │
    Tools: 시간, 웹검색, 기억, 노트(세컨브레인), 리마인더, 정기작업, 캘린더, Gmail,
-          코드(Claude Code CLI), 휴 조명, 안드로이드(ADB), 브라우저(Playwright), 유튜브
-        ↑
-   APScheduler (능동 알림 + 정기 작업 + 노트 증분 색인)
+          코드(Claude Code CLI), 휴 조명, 안드로이드(ADB), 브라우저(Playwright),
+          유튜브, 지도(카카오), 카메라
+        ↑                              ↑
+   APScheduler                    비전 데몬 (WS /ws/vision — 요청할 때만 프레임 한 장)
+   (능동 알림 + 정기 작업 + 노트 색인)
 ```
 
 흐름은 **prepare(프로필·기억 동시 조회) → 에이전트 → 도구 실행 → 반추(reflect)**. 도구가 필요하면 ReAct 루프를 돌고, 쓰기 작업은 LangGraph `interrupt`로 그래프 흐름 안에서 확인을 받는다. 확인은 웹 화면·음성("네/아니오") 양쪽에 다 연결돼 있다.
@@ -86,6 +90,8 @@ uvicorn app.main:app --reload
 | `YOUTUBE_API_KEY` | 유튜브 데이터 API(선택) | (빈값) |
 | `NOTES_PATH` | 색인할 노트 폴더(선택). 비우면 노트 도구만 안내 문구 | (빈값) |
 | `NOTES_EXTENSIONS` / `NOTES_INDEX_MINUTES` | 색인 대상 확장자·주기 | `.md,.txt,.pdf` / `10` |
+| `KAKAO_REST_API_KEY` / `HOME_ADDRESS` | 지도(선택)·기본 출발지 | (빈값) |
+| `FACE_EMBEDDING_DIM` / `VISION_MODEL` | 얼굴 임베딩 차원·사진 설명 모델 | `128` / (LLM_MODEL) |
 | `DATABASE_URL` | Postgres 접속 문자열 | compose 기본값 |
 | `TIMEZONE` | 스케줄러·시간 표시 기준 | `Asia/Seoul` |
 | `USE_POSTGRES_CHECKPOINTER` | 대화 영속화 | `true` |
@@ -210,6 +216,50 @@ NOTES_PATH=C:\Users\User\Documents\Obsidian\vault
 - 실행마다 대화 맥락을 새로 시작한다. 앞선 실행에 확인 대기가 남아 있어도 다음 실행이 거기 물리지 않는다.
 - **승인해 줄 사람이 없는 시간대에 도는 만큼, 쓰기 도구 확인이 걸리면 실행하지 않고** 취소로 정리한 뒤 "확인이 필요해서 안 했다"고만 알린다.
 
+## 카메라
+
+음성 데몬과 별개로 도는 프로세스다.
+
+```bash
+pip install -r voice_client/requirements.txt   # opencv-python, mediapipe(선택)
+python voice_client/jarvis_vision.py --test    # 미리보기 창으로 인식 상태 확인
+python voice_client/jarvis_vision.py --enroll 창래 --relation 본인
+python voice_client/jarvis_vision.py           # 상시 실행
+```
+
+얼굴은 OpenCV의 **YuNet**(검출) + **SFace**(특징)로 본다. dlib이나 insightface와 달리 pip만으로 Windows에 깔리고, 모델은 첫 실행 때 자동으로 받는다(합쳐 38MB). 등록은 여러 프레임의 임베딩을 평균 낸다 — 한 장만 쓰면 그 각도에만 맞는다.
+
+**사진은 서버로 가지 않는다.** 얼굴 임베딩 계산과 매칭이 전부 데몬(로컬)에서 끝나고, 서버는 등록된 얼굴의 임베딩만 보관·배포한다. 아이 얼굴 같은 걸 클라우드에 두지 않기 위해서다. 클라우드로 나가는 건 *"이거 뭐야"* 하고 물었을 때의 프레임 한 장뿐이고, 그것도 물어봤을 때만 보낸다 — 서버가 `/ws/vision`으로 "한 장 줘" 하면 그때 응답한다. 평소엔 아무것도 올리지 않는다.
+
+인식 결과는 30초가 지나면 버린다. 한참 전에 본 사람을 *지금 있다*고 답하느니 모른다고 하는 게 낫다.
+
+**제스처**는 두 손 모션만 본다(벌리기·모으기·내리기·올리기). 한 손 포즈(손바닥·주먹)는 손을 들기만 해도 오발동해서 카메라 앞에서 아무것도 못 하게 된다 — Dx의 `docs/features/gesture_control.md`에 같은 결론이 적혀 있다. `--control`을 주면 미디어 키에 연결되고, 기본은 인식만 해서 HUD에 띄운다. `mediapipe`가 없으면 제스처만 꺼지고 나머지는 그대로 돈다.
+
+## 어디서나 접속 (Tailscale)
+
+코드 변경 없이 된다. **[접속 토큰](#접속-토큰)을 먼저 채우고** 시작할 것 — 사설망 뒤라도 무인증으로 열어 두면 안 된다.
+
+```bash
+tailscale up
+tailscale serve --bg http://localhost:8000
+tailscale status            # 접속 주소 확인
+```
+
+tailnet 안에서 HTTPS로 붙는다. PWA는 이미 있으니 폰 브라우저로 그 주소를 열고 홈 화면에 추가하면 앱처럼 쓴다. HTTPS라 브라우저 마이크도 열린다(로컬 IP로는 안 된다).
+
+운전 중에는 음성 데몬을 `JAVIS_DRIVE=1`로 띄우면 답변이 두세 문장으로 줄어든다.
+
+## 지도
+
+```bash
+KAKAO_REST_API_KEY=...      # developers.kakao.com 에서 REST API 키
+HOME_ADDRESS=제주시 ...      # 출발지를 안 밝혔을 때의 기본값
+```
+
+장소 검색은 카카오 Local, 길찾기는 카카오모빌리티를 쓴다(같은 키). 길찾기는 콘솔에서 별도 신청이 필요할 수 있다.
+
+운전 중에 듣는 용도라 답이 짧다 — 소요시간·거리·통행료만 주고 경로 좌표는 받지 않는다(`summary=true`). 마지막 줄의 길안내 주소를 `open_android_app`에 넘기면 폰에서 바로 열린다.
+
 ## 점검용 엔드포인트
 
 - `GET /health` — 상태, OpenAI 키 유무
@@ -226,17 +276,19 @@ app/
 ├── llm.py             OpenAI 클라이언트 팩토리(재시도/타임아웃)
 ├── agent/             LangGraph (state, nodes, graph, prompts, runtime)
 ├── tools/             builtin, search, notes, reminders, schedules, calendar,
-│                      gmail, code, hue, android, browser, youtube
+│                      gmail, code, hue, android, browser, youtube, maps, vision
 ├── memory/            장기 기억 (pgvector) + 노트 색인 (indexer)
 ├── voice/             STT / TTS
-├── api/               ws, rest, voice, hud, notifications, deps(인증)
+├── api/               ws, rest, voice, hud, vision, notifications, deps(인증)
 ├── db/                모델, 세션, 감사 로그
 └── static/            설치형 PWA 클라이언트 + HUD 화면
 scripts/
 ├── google_auth.py     Google OAuth 1회 인증
 └── hue_auth.py        필립스 휴 앱키 1회 발급
 tests/                 도구 레지스트리·인증·각 도구 단위 검증 (pytest)
-voice_client/          PC 상주 음성 데몬 (웨이크워드·박수·TTS 파이프라인)
+voice_client/
+├── jarvis_voice.py    음성 데몬 (웨이크워드·박수·TTS 파이프라인)
+└── jarvis_vision.py   비전 데몬 (얼굴·제스처·프레임 요청 응답)
 ```
 
 ```bash
@@ -267,7 +319,8 @@ pytest
 - [x] 도구: 필립스 휴, 안드로이드(ADB), 브라우저 자동화, 유튜브
 - [x] 사용자가 걸어 두는 정기 작업
 - [x] 세컨브레인 (노트 색인 RAG, 음성으로 듣기)
-- [ ] 카메라 (얼굴·사물 인식, 제스처)
-- [ ] 원격 접속 (Tailscale)
+- [x] 카메라 (얼굴 인식, 사진 보고 답하기, 두 손 제스처)
+- [x] 지도 (장소 검색·길찾기)
+- [x] 원격 접속 (Tailscale — 인증 + PWA 로 코드 변경 없이)
 - [ ] 화자 인식
 - [ ] 멀티 디바이스 동기화

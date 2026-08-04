@@ -37,6 +37,25 @@ class Reminder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ScheduledJob(Base):
+    """사용자가 말로 걸어 둔 정기 작업.
+
+    cron 이 되면 prompt 를 자비스에게 그대로 물어보고 답을 알림으로 띄운다.
+    리마인더가 '정해 둔 문장을 그때 알려주는' 것이라면, 이쪽은 '그때 가서 실제로
+    알아보고 알려주는' 것이다.
+    """
+
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    cron: Mapped[str] = mapped_column(String(64))  # 표준 5필드 (분 시 일 월 요일)
+    prompt: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AuditLog(Base):
     """LLM 호출·도구 실행 기록. 자비스가 이상하게 굴 때 추적할 유일한 단서."""
 

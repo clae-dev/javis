@@ -204,7 +204,7 @@ async def _index_file(path: Path, root: Path) -> int:
         if row is not None and row.mtime == mtime:
             return 0
 
-    text = await asyncio.to_thread(_read_text, path)
+    text = await asyncio.to_thread(read_text, path)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     async with async_session() as session:
@@ -296,11 +296,15 @@ async def reindex() -> str:
         files = await asyncio.to_thread(_walk, root)
         indexed = 0
         chunks = 0
+        failed = 0
         for path in files:
             try:
                 made = await _index_file(path, root)
             except Exception as exc:
+                # 파일 하나가 깨져도 나머지는 색인한다. 다만 조용히 넘기지는 않는다 —
+                # 전부 실패해도 "바뀐 내용 없음"으로 보이면 고장을 눈치챌 수가 없다.
                 log.warning("노트 색인 실패(%s): %s", path.name, exc)
+                failed += 1
                 continue
             if made:
                 indexed += 1
@@ -313,7 +317,9 @@ async def reindex() -> str:
         parts.append(f"{indexed}개 새로 색인({chunks}조각)")
     if removed:
         parts.append(f"{removed}개 삭제 반영")
-    if not indexed and not removed:
+    if failed:
+        parts.append(f"{failed}개 실패(로그 확인)")
+    if not indexed and not removed and not failed:
         parts.append("바뀐 내용 없음")
     return ", ".join(parts)
 

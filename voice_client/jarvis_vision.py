@@ -64,6 +64,10 @@ AUTH_HEADERS = {"X-Javis-Token": TOKEN} if TOKEN else {}
 CAMERA_INDEX = int(os.environ.get("JAVIS_CAMERA", "0"))
 # 얼굴을 몇 초마다 확인할지. 매 프레임 돌릴 이유가 없다 — 사람은 그렇게 빨리 안 바뀐다.
 FACE_INTERVAL = float(os.environ.get("JAVIS_FACE_INTERVAL", "1.0"))
+# 바뀐 게 없어도 이만큼마다 한 번은 현재 상태를 다시 보낸다.
+# 서버는 오래된 인식 결과를 버리므로(SIGHTING_TTL), 가만히 앉아 있는 사람이
+# 조용히 '없는 사람'이 되지 않게 하려면 주기적으로 살아 있다고 알려야 한다.
+STATE_REFRESH = float(os.environ.get("JAVIS_STATE_REFRESH", "10.0"))
 # SFace 코사인 유사도 임계값. OpenCV 권장값이 0.363 이다. 높일수록 엄격(오인식↓, 미인식↑).
 FACE_THRESHOLD = float(os.environ.get("JAVIS_FACE_THRESHOLD", "0.363"))
 DETECT_SCORE = float(os.environ.get("JAVIS_FACE_SCORE", "0.8"))
@@ -307,6 +311,7 @@ class VisionDaemon:
         self.ws: websocket.WebSocket | None = None
         self.running = True
         self.last_state: tuple[tuple[str, ...], int] = ((), 0)
+        self.last_sent = 0.0
 
     # --- 통신 ---
 
@@ -391,12 +396,15 @@ class VisionDaemon:
 
         self.boxes = boxes
         state = (tuple(names), unknown)
-        if state == self.last_state:
-            return  # 바뀐 게 없으면 보내지 않는다
-        self.last_state = state
+        changed = state != self.last_state
+        stale = time.time() - self.last_sent >= STATE_REFRESH
+        if not changed and not stale:
+            return  # 바뀐 것도 없고 아직 신선하다
 
+        self.last_state = state
+        self.last_sent = time.time()
         self.send({"type": "faces", "names": names, "unknown": unknown})
-        if names:
+        if changed and names:
             print(f"보임: {', '.join(names)}" + (f" (+모르는 사람 {unknown})" if unknown else ""))
 
     def _draw(self, frame) -> bool:
@@ -414,7 +422,6 @@ class VisionDaemon:
     # --- 메인 루프 ---
 
     def run(self) -> None:
-        print(self.faces.load_known())
         print(f"제스처: {'켜짐' if self.gestures else '꺼짐 (mediapipe 없음)'}")
 
         camera = threading.Thread(target=self._camera_loop, daemon=True)
@@ -427,6 +434,9 @@ class VisionDaemon:
                     ws.send(json.dumps({"token": TOKEN}))
                 self.ws = ws
                 print(f"서버 연결됨: {WS_URL}")
+                # 등록된 얼굴은 붙을 때마다 다시 받는다. 기동 때 한 번만 받으면,
+                # 그 순간 서버가 죽어 있었을 때 영영 아무도 못 알아본다.
+                print(self.faces.load_known())
                 self.hud("vision", "카메라 준비됨")
 
                 while self.running:
@@ -434,8 +444,12 @@ class VisionDaemon:
                         message = json.loads(ws.recv())
                     except websocket.WebSocketTimeoutException:
                         continue  # 조용한 시간. 연결은 살아 있다.
-                    if (message or {}).get("type") == "capture":
+                    kind = (message or {}).get("type")
+                    if kind == "capture":
                         self._send_frame()
+                    elif kind == "faces_updated":
+                        # 방금 누가 등록·삭제됐다. 데몬을 다시 띄우지 않아도 반영된다.
+                        print(self.faces.load_known())
             except KeyboardInterrupt:
                 self.running = False
             except Exception as exc:
@@ -542,6 +556,10 @@ def forget_face(name: str) -> int:
 
 
 def main() -> int:
+    # 상시 데몬이라 보통 로그 파일로 넘겨 돌린다. 기본 버퍼링이면 프로세스가 끝날
+    # 때까지 한 줄도 안 찍혀서, 사실상 로그가 없는 것과 같아진다.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="자비스 비전 데몬")
     parser.add_argument("--test", action="store_true", help="미리보기 창을 띄운다")
     parser.add_argument("--control", action="store_true", help="제스처로 미디어 키를 누른다")

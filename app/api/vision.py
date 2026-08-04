@@ -166,6 +166,19 @@ async def vision_ws(ws: WebSocket) -> None:
 # --- 등록된 얼굴 ---
 
 
+async def _notify_faces_changed() -> None:
+    """등록·삭제 직후 데몬에게 목록을 다시 받으라고 알린다.
+
+    이게 없으면 얼굴을 등록해 놓고도 데몬을 다시 띄울 때까지 못 알아본다.
+    """
+    if _client is None:
+        return
+    try:
+        await _client.send_json({"type": "faces_updated"})
+    except Exception as exc:
+        log.debug("얼굴 갱신 알림 실패(무시): %s", exc)
+
+
 def _floats(vector) -> list[float]:
     """pgvector 는 numpy 배열을 돌려준다. numpy.float32 는 JSON 으로 못 나간다."""
     return [float(v) for v in vector]
@@ -209,6 +222,7 @@ async def enroll_face(payload: dict = Body(...)) -> dict:
             created = False
         await session.commit()
 
+    await _notify_faces_changed()
     return {"ok": True, "name": name, "created": created}
 
 
@@ -222,4 +236,6 @@ async def forget_face(name: str) -> dict:
             raise HTTPException(404, f"'{name}' 은(는) 등록돼 있지 않습니다.")
         await session.delete(row)
         await session.commit()
+
+    await _notify_faces_changed()
     return {"ok": True, "name": name}

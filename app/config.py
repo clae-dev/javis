@@ -54,6 +54,30 @@ class Settings(BaseSettings):
     google_credentials_path: str = "credentials/google.json"
     google_token_path: str = "credentials/token.json"
 
+    # 필립스 휴. 브리지 IP 를 비우면 discovery.meethue.com 으로 찾는다.
+    # 앱키는 `python scripts/hue_auth.py` 로 1회 발급한다.
+    hue_bridge_ip: str = ""
+    hue_app_key: str = ""
+
+    # 안드로이드 (ADB). adb 가 PATH 에 없으면 실행 파일 경로를 직접 적는다.
+    # 기기가 여럿이면 android_serial 로 하나를 고정한다(`adb devices` 로 확인).
+    android_adb_path: str = ""
+    android_serial: str = ""
+    # 문자를 '작성만' 할지 '보내기까지' 할지. 자동 전송은 메시지 앱 화면 구성에 기대는
+    # 방식이라 기기에 따라 안 먹을 수 있다. 기본은 작성까지만.
+    android_sms_autosend: bool = False
+
+    # 브라우저 자동화 (Playwright). 로그인 세션을 유지하려고 프로필을 한곳에 둔다.
+    browser_user_data_dir: str = "credentials/browser"
+    browser_headless: bool = True
+    browser_timeout: float = 30.0
+
+    # 유튜브 데이터 API. 콘솔에서 API 키만 발급하면 된다(구글 OAuth 스코프는 안 건드린다).
+    youtube_api_key: str = ""
+
+    # 도구가 남기는 캡처물(폰 스크린샷 등) 보관 위치.
+    captures_path: str = "captures"
+
     # Claude Code 연동 (음성 코딩). 여기 등록한 프로젝트만 열 수 있다.
     # 형식: "이름=경로,이름=경로"  예) javis=C:\workspace\Javis
     code_projects: str = ""

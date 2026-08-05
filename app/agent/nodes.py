@@ -223,6 +223,30 @@ async def _reflect_worker(messages: list, old_summary: str | None, thread_id: st
         log.warning("반추 단계 실패(무시): %s", exc)
 
 
+# 이보다 짧은 한 마디로 끝난 턴은 새로 기억할 게 거의 없다. "응"·"고마워"·"알겠어"
+# 같은 맞장구까지 반추를 돌리면 턴마다 LLM 왕복이 붙는다 — 백그라운드라 응답은 안
+# 늦지만 비용과 API 부하는 그대로 쌓인다.
+_REFLECT_MIN_CHARS = 12
+
+
+def _worth_reflecting(messages: list) -> bool:
+    """이 턴에 새로 알게 된 게 있을 법한지 훑는다.
+
+    도구를 썼다면 실제로 뭔가 한 턴이니 무조건 본다. 그게 아니면 사용자 발화가
+    맞장구 수준을 넘을 때만 본다. 건너뛴 턴은 감정도 갱신되지 않지만, 맞장구
+    한 마디로 기분이 바뀌었다고 볼 이유도 없어 직전 값을 그대로 쓴다.
+    """
+    turn = messages
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            turn = messages[i:]
+            break
+
+    if any(getattr(m, "tool_calls", None) for m in turn):
+        return True
+    return len(_last_human_text(turn).strip()) >= _REFLECT_MIN_CHARS
+
+
 async def reflect(state: JarvisState, config: RunnableConfig) -> dict:
     """기억 저장과 감정 읽기를 백그라운드로 떼어내 응답 지연을 없앤다.
 
@@ -230,6 +254,8 @@ async def reflect(state: JarvisState, config: RunnableConfig) -> dict:
     종료한다. 여기서 읽은 감정은 다음 턴 응답에 반영된다(한 턴 지연).
     """
     recent = list(state["messages"][-6:])
+    if not _worth_reflecting(recent):
+        return {}
     # prepare 가 이미 끌어온 프로필 요약을 넘겨, 프로필 갱신 때 같은 행을 다시 읽지 않게 한다.
     summary = (state.get("user_profile") or {}).get("summary")
     _spawn(_reflect_worker(recent, summary, _thread_id(config)))

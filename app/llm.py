@@ -35,7 +35,12 @@ def fast(temperature: float = 0.0) -> ChatOpenAI:
 def embeddings() -> OpenAIEmbeddings:
     global _embeddings
     if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(model=settings.embedding_model, max_retries=3)
+        kwargs = {"model": settings.embedding_model, "max_retries": 3}
+        # text-embedding-3 계열만 차원 축소를 지원한다. EMBEDDING_DIM 을 낮추면 벡터가
+        # 작아져 HNSW 검색·적재가 가벼워진다. 옛 모델(ada-002 등)에 넘기면 에러라 거른다.
+        if settings.embedding_model.startswith("text-embedding-3"):
+            kwargs["dimensions"] = settings.embedding_dim
+        _embeddings = OpenAIEmbeddings(**kwargs)
     return _embeddings
 
 

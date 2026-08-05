@@ -107,6 +107,11 @@ TTS_FIRST_LOCAL = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "1") != "0"
 # 운전 모드. 백엔드가 답변을 두세 문장으로 줄인다.
 DRIVE_MODE = os.environ.get("JAVIS_DRIVE", "0") != "0"
 
+# 백엔드 웹소켓은 한 번 붙여 두고 계속 쓴다. 다만 이만큼(초) 놀린 연결은 NAT·방화벽이
+# 조용히 끊어 놓았을 수 있어, 쓰기 전에 새로 붙는다. 죽은 소켓에 보내면 살아 있는 줄
+# 알고 응답을 기다리다 타임아웃까지 통째로 날린다.
+WS_IDLE_MAX = float(os.environ.get("JAVIS_WS_IDLE_MAX", "120"))
+
 
 def _resolve_device(hint: str, kind: str):
     """이름 일부로 오디오 장치를 찾는다. 못 찾거나 힌트가 없으면 None(기본 장치)."""
@@ -185,50 +190,119 @@ def _first_cut(buf: str) -> int:
 _KOREAN_VOICE_HINTS = ("korean", "한국")
 
 
-def _tts_local(text: str):
-    """Windows SAPI 로 즉시 합성해 (오디오, 샘플레이트) 를 준다. 실패하면 None.
+class _LocalTTS:
+    """Windows SAPI 합성기를 전용 스레드 하나에 가둬 두고 재사용한다.
 
-    클라우드 왕복(수백 ms)이 통째로 빠지므로 답변 첫 덩어리만 여기로 보내 첫 소리를
-    앞당긴다. 목소리 품질은 클라우드가 낫기 때문에 나머지 문장은 그쪽으로 간다.
+    합성 자체는 빠른데 준비가 비쌌다. 발화마다 CoInitialize → SAPI.SpVoice 생성 →
+    설치된 음성 전체 열거를 다시 하면 수백 ms 가 붙는다 — 하필 '첫 소리를 앞당기려고'
+    로컬 합성을 쓰는 구간이라 벌어 온 시간을 그대로 까먹는다.
+
+    COM 객체는 만든 스레드에서만 안전하게 쓸 수 있어서, 스레드를 하나 띄워 거기서
+    딱 한 번 준비하고 이후에는 텍스트만 넘긴다. 요청 큐로 받고 결과는 일회용 큐로
+    돌려준다.
     """
-    if os.name != "nt":
-        return None
 
-    tmp = None
-    try:
-        import pythoncom
+    def __init__(self) -> None:
+        self._jobs: "queue.Queue[tuple[str, queue.Queue]]" = queue.Queue()
+        self._ready = threading.Event()
+        self._voice = None
+        self._ok = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def warm(self, timeout: float = 10.0) -> bool:
+        """준비가 끝날 때까지 기다린다. 이 기계에서 못 쓰면 False."""
+        self._ready.wait(timeout)
+        return self._ok
+
+    def synth(self, text: str, timeout: float = 10.0):
+        """(오디오, 샘플레이트) 또는 실패 시 None. 호출부는 None 이면 클라우드로 간다."""
+        if not self._ok:
+            return None
+        box: "queue.Queue" = queue.Queue(maxsize=1)
+        self._jobs.put((text, box))
+        try:
+            return box.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _loop(self) -> None:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            self._voice = win32com.client.Dispatch("SAPI.SpVoice")
+            # 기본 음성이 영어면 한국어를 이상하게 읽는다. 한국어 음성이 있으면 그걸 쓴다.
+            for token in self._voice.GetVoices():
+                if any(h in token.GetDescription().lower() for h in _KOREAN_VOICE_HINTS):
+                    self._voice.Voice = token
+                    break
+            self._ok = True
+        except Exception as exc:
+            if DEBUG:
+                print("  (로컬 합성 사용 불가 → 클라우드)", exc, flush=True)
+        finally:
+            self._ready.set()
+
+        if not self._ok:
+            return
+
+        while True:
+            text, box = self._jobs.get()
+            box.put(self._speak(text))
+
+    def _speak(self, text: str):
+        # 메모리 스트림 대신 임시 파일을 거친다. SAPI 메모리 스트림은 헤더 없는 PCM 이
+        # 나와 포맷을 손으로 맞춰야 하는데, 짧은 문장 파일 하나 쓰고 읽는 비용은 어차피
+        # 위에서 걷어낸 COM 준비 비용에 비하면 없는 것과 같다.
         import win32com.client
 
-        pythoncom.CoInitialize()
+        tmp = None
         try:
-            voice = win32com.client.Dispatch("SAPI.SpVoice")
-            # 기본 음성이 영어면 한국어를 이상하게 읽는다. 한국어 음성이 있으면 그걸 쓴다.
-            for token in voice.GetVoices():
-                if any(h in token.GetDescription().lower() for h in _KOREAN_VOICE_HINTS):
-                    voice.Voice = token
-                    break
-
             fd, tmp = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
             stream = win32com.client.Dispatch("SAPI.SpFileStream")
             stream.Open(tmp, 3)  # 3 = 쓰기용으로 새로 만들기
-            voice.AudioOutputStream = stream
-            voice.Speak(text)
+            self._voice.AudioOutputStream = stream
+            self._voice.Speak(text)
             stream.Close()
-
             return sf.read(tmp, dtype="float32")
+        except Exception as exc:
+            if DEBUG:
+                print("  (로컬 합성 실패 → 클라우드)", exc, flush=True)
+            return None
         finally:
-            pythoncom.CoUninitialize()
-    except Exception as exc:
-        if DEBUG:
-            print("  (로컬 합성 실패 → 클라우드)", exc, flush=True)
-        return None
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
+_local_tts: "_LocalTTS | None" = None
+
+
+def _start_local_tts() -> None:
+    """로컬 합성기를 미리 띄운다. 첫 발화가 COM 초기화를 기다리지 않게 한다."""
+    global _local_tts
+    if os.name != "nt" or not TTS_FIRST_LOCAL or _local_tts is not None:
+        return
+    _local_tts = _LocalTTS()
+    if _local_tts.warm():
+        # 객체를 만드는 것과 별개로, 첫 Speak 에도 한 번뿐인 준비 비용이 붙는다
+        # (실측 200ms 남짓). 짧은 문장 하나를 버리는 셈 치고 합성해 그것까지 여기서
+        # 치른다. 재생은 하지 않으니 아무 소리도 나지 않는다.
+        _local_tts.synth("네")
+
+
+def _tts_local(text: str):
+    """Windows SAPI 로 즉시 합성해 (오디오, 샘플레이트) 를 준다. 못 쓰면 None.
+
+    클라우드 왕복(수백 ms)이 통째로 빠지므로 답변 첫 덩어리만 여기로 보내 첫 소리를
+    앞당긴다. 목소리 품질은 클라우드가 낫기 때문에 나머지 문장은 그쪽으로 간다.
+    """
+    _start_local_tts()  # 미리 안 띄웠으면 여기서 한 번(이후 호출은 그냥 통과)
+    return _local_tts.synth(text) if _local_tts is not None else None
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -317,6 +391,8 @@ class Jarvis:
             callback=self._on_audio,
         )
         self.oww = self._init_oww()
+        self.ws: "websocket.WebSocket | None" = None
+        self._ws_used = 0.0
 
     def _init_oww(self):
         """openWakeWord 엔진. 비활성/실패면 None(→ Vosk 폴백)."""
@@ -488,14 +564,58 @@ class Jarvis:
         for t in threads:
             t.join()
 
-    def chat(self, text: str) -> str:
+    def _connect(self) -> "websocket.WebSocket":
+        """백엔드 웹소켓을 준비한다. 살아 있으면 쓰던 걸 그대로 쓴다.
+
+        발화마다 새로 열면 턴마다 TCP·웹소켓 핸드셰이크와 인증 프레임이 앞에 붙는다.
+        이어 말하기(follow-up)로 10초마다 오가는 상황이나 원격으로 붙어 있을 때는
+        이 왕복이 그대로 첫 응답 지연이 된다.
+        """
+        ws = self.ws
+        if ws is not None and time.time() - self._ws_used <= WS_IDLE_MAX:
+            try:
+                if ws.connected:
+                    return ws
+            except Exception:
+                pass
+        self._close_ws()
+
         ws = websocket.create_connection(WS_URL, timeout=120)
         if TOKEN:
             ws.send(json.dumps({"token": TOKEN}))  # 첫 프레임이 인증
+        self.ws = ws
+        return ws
+
+    def _close_ws(self) -> None:
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def chat(self, text: str) -> str:
         payload = {"content": text}
         if DRIVE_MODE:
             payload["mode"] = "drive"  # 백엔드가 답변을 두세 문장으로 줄인다
-        ws.send(json.dumps(payload))
+        body = json.dumps(payload)
+
+        # 다시 붙는 건 '보내기까지'만이다. 토큰이 오기 시작한 뒤에 재시도하면 이미 말한
+        # 문장을 한 번 더 말하게 된다.
+        for last_try in (False, True):
+            try:
+                ws = self._connect()
+                ws.send(body)
+                break
+            except Exception:
+                self._close_ws()
+                if last_try:
+                    raise
+
+        return self._converse(ws)
+
+    def _converse(self, ws: "websocket.WebSocket") -> str:
+        """한 번의 응답을 끝까지 받아 말한다. 받은 전체 텍스트를 돌려준다."""
         speak_q, player = self._start_player()
         reply = ""
         buf = ""
@@ -540,8 +660,11 @@ class Jarvis:
                     reply = "처리 중에 문제가 생겼어: " + msg.get("message", "")
                     speak_q.put(reply)
                     break
+            self._ws_used = time.time()  # 끝까지 정상으로 받았다 = 다음 턴에 재사용 가능
+        except Exception:
+            self._close_ws()  # 중간에 끊긴 연결은 상태가 어긋나 있다. 다음 턴에 새로 붙는다.
+            raise
         finally:
-            ws.close()
             if buf.strip():
                 speak_q.put(buf.strip())
             self._drain_player(speak_q, player)  # 다 말할 때까지 기다린다
@@ -594,7 +717,12 @@ class Jarvis:
             self._tts_play(*clip)
 
     def prime_acks(self) -> None:
-        """깨움 응답을 시작 시 한 번만 합성해 캐시한다. 이후 깨움은 네트워크 왕복 없이 즉시 재생."""
+        """시작 시 한 번만 준비해 두는 것들.
+
+        깨움 응답은 미리 합성해 두면 이후 깨움이 네트워크 왕복 없이 즉시 나간다.
+        로컬 합성기도 여기서 띄워, 첫 답변이 COM 초기화를 기다리지 않게 한다.
+        """
+        _start_local_tts()
         self._ack_clips = [c for c in (self._tts_fetch(p) for p in WAKE_ACKS) if c is not None]
 
     def ack(self) -> None:
@@ -705,6 +833,8 @@ def main() -> None:
         daemon.run()
     except KeyboardInterrupt:
         print("\n종료합니다.")
+    finally:
+        daemon._close_ws()
 
 
 if __name__ == "__main__":

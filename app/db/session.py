@@ -7,7 +7,15 @@ from app.config import settings
 
 log = logging.getLogger("javis.db")
 
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+# 한 턴이 커넥션을 여럿 잡는다. 도구가 여러 개 호출되면 gather 로 동시에 돌고, 각자
+# 별도 세션을 쓰고, 감사 로그까지 백그라운드로 또 하나씩 잡는다. 기본값(5)이면 도구
+# 서너 개짜리 턴에서 풀이 바닥나 응답이 커넥션 대기로 직렬화된다.
+engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

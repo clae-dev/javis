@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o"
     fast_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
+    # text-embedding-3 계열은 차원을 줄여서 받을 수 있다(512/1024). 벡터가 작아지는 만큼
+    # HNSW 검색·적재와 DB 용량이 가벼워지고, 한국어 짧은 문장 검색 품질은 거의 그대로다.
+    # 다만 이 값을 바꾸면 기존 벡터와 섞이지 않는다 — memory_items / document_chunks 를
+    # 지우고(DROP TABLE) 다시 띄운 뒤 기억·노트를 새로 색인해야 한다.
     embedding_dim: int = 1536
     # gpt-4o-mini-transcribe 는 whisper-1 보다 응답이 빠르다. 호환 문제가 있으면
     # .env 에서 STT_MODEL=whisper-1 로 되돌릴 수 있다.
@@ -26,6 +30,9 @@ class Settings(BaseSettings):
     # 네트워크 왕복이 없어 차 안에서 유리하다. 실패 시 자동으로 클라우드로 넘어간다.
     stt_engine: str = "openai"
     stt_local_model: str = "small"  # tiny / base / small / medium / large-v3
+    # 로컬 받아쓰기 빔 폭. 자비스에게 오는 건 대개 한두 문장짜리 명령이라 1 로도 충분하고,
+    # 5 에 비해 디코딩이 눈에 띄게 빠르다. 잘 못 알아들으면 올린다.
+    stt_local_beam: int = 1
     tts_model: str = "gpt-4o-mini-tts"
     tts_voice: str = "alloy"
     # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 음성에 감정을 싣는다.
@@ -36,6 +43,10 @@ class Settings(BaseSettings):
 
     # DB
     database_url: str = "postgresql+asyncpg://jarvis:jarvis@localhost:5432/jarvis"
+    # 한 턴이 커넥션을 여럿 잡는다(도구 동시 실행 + 백그라운드 감사 로그).
+    # SQLAlchemy 기본값 5 로는 도구 서너 개짜리 턴에서 대기가 생긴다.
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
 
     # 인격 / 로캘
     assistant_name: str = "자비스"

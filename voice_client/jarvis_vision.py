@@ -75,6 +75,14 @@ FACE_THRESHOLD = float(os.environ.get("JAVIS_FACE_THRESHOLD", "0.363"))
 DETECT_SCORE = float(os.environ.get("JAVIS_FACE_SCORE", "0.8"))
 JPEG_QUALITY = int(os.environ.get("JAVIS_JPEG_QUALITY", "85"))
 
+# 제스처를 초당 몇 번까지 볼지. 카메라가 주는 대로(30fps) 다 돌리면 손 랜드마크 추론이
+# 이 데몬 CPU 의 대부분을 먹는다(실측 720p 한 프레임에 8.5ms → 30fps 면 코어 하나의 25%).
+# 두 손이 실제로 잡히는 건 초당 7~8회라 15fps 로 묶어도 판정 창의 표본 수는 그대로다.
+# 프레임을 미리 줄여 넣는 것도 재 봤지만 소용없다 — mediapipe 가 어차피 내부에서 고정
+# 크기로 다시 줄여서, 리사이즈 비용이 색변환에서 아낀 만큼을 그대로 도로 먹는다.
+# 0 이면 스로틀 없이 매 프레임.
+GESTURE_FPS = float(os.environ.get("JAVIS_GESTURE_FPS", "15"))
+
 MODELS = {
     "detector": (
         "face_detection_yunet_2023mar.onnx",
@@ -250,7 +258,6 @@ class GestureEngine:
     GAP_TOLERANCE = 0.6  # 두 손이 이만큼 안 보이면 추적을 버린다(손을 내린 것)
     MOVE = 0.20  # 정규화 좌표 기준 변화량
     COOLDOWN = 1.0
-    FRAME_MS = 33  # VIDEO 모드가 요구하는 단조 증가 타임스탬프의 한 칸
 
     def __init__(self) -> None:
         import mediapipe as mp
@@ -267,7 +274,10 @@ class GestureEngine:
             )
         )
         self.connections = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
-        self.frames = 0
+        # VIDEO 모드는 단조 증가하는 타임스탬프를 요구한다. 실제 경과 시간으로 센다 —
+        # '프레임 수 × 고정 간격'으로 세면 호출 주기를 바꾸는 순간 실제 시간과 어긋난다.
+        self._t0: float | None = None
+        self._stamp = 0
         # (시각, 두 손 간격, 두 손 평균 높이)
         self.samples: deque[tuple[float, float, float]] = deque()
         self.last_seen = 0.0
@@ -287,14 +297,18 @@ class GestureEngine:
         return True
 
     def feed(self, frame) -> str | None:
+        now = time.monotonic()
+        if self._t0 is None:
+            self._t0 = now
+        # 밀리초 단위로 잘리면 같은 값이 두 번 나올 수 있는데, VIDEO 모드는 그걸 거부한다.
+        self._stamp = max(int((now - self._t0) * 1000), self._stamp + 1)
+
         image = self._mp.Image(
             image_format=self._mp.ImageFormat.SRGB,
             data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
         )
-        self.frames += 1
-        result = self.landmarker.detect_for_video(image, self.frames * self.FRAME_MS)
+        result = self.landmarker.detect_for_video(image, self._stamp)
 
-        now = time.monotonic()
         marks = result.hand_landmarks or []
         self.last_marks = marks
         if len(marks) != 2:
@@ -413,6 +427,8 @@ class VisionDaemon:
             return
 
         last_check = 0.0
+        last_gesture = 0.0
+        gesture_period = 1.0 / GESTURE_FPS if GESTURE_FPS > 0 else 0.0
         try:
             while self.running:
                 ok, frame = cap.read()
@@ -428,12 +444,16 @@ class VisionDaemon:
                     last_check = now
                     self._check_faces(frame)
 
-                if self.gestures and (gesture := self.gestures.feed(frame)):
-                    print(f"제스처: {gesture}")
-                    self.last_gesture = gesture
-                    self.send({"type": "gesture", "name": gesture})
-                    if self.control:
-                        press_media(gesture)
+                # 얼굴과 마찬가지로 제스처도 필요한 만큼만 본다. 카메라가 주는 대로 다
+                # 돌리면 손 랜드마크 추론이 이 루프의 시간을 거의 다 먹는다.
+                if self.gestures and now - last_gesture >= gesture_period:
+                    last_gesture = now
+                    if gesture := self.gestures.feed(frame):
+                        print(f"제스처: {gesture}")
+                        self.last_gesture = gesture
+                        self.send({"type": "gesture", "name": gesture})
+                        if self.control:
+                            press_media(gesture)
 
                 if self.preview and not self._draw(frame):
                     self.running = False

@@ -59,6 +59,9 @@ class Settings(BaseSettings):
 
     # 동작 토글
     use_postgres_checkpointer: bool = True
+    # Postgres 체크포인터를 못 쓸 때 물러날 파일. 윈도우 호스트에서 백엔드를 띄우면
+    # psycopg 가 붙지 못하는데(이벤트 루프 문제), 여기로 물러나면 재시작해도 대화가 이어진다.
+    checkpoint_sqlite_path: str = "credentials/checkpoints.sqlite"
     enable_scheduler: bool = True
 
     # Google

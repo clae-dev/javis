@@ -11,6 +11,8 @@ __pycache__/
 credentials/*.json
 !credentials/.gitkeep
 credentials/browser/
+# 대화 체크포인트(-wal/-shm 포함). Postgres 를 못 쓸 때만 생긴다.
+credentials/*.sqlite*
 
 # 폰 스크린샷 등 도구가 남기는 캡처물
 captures/

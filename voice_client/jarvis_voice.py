@@ -417,6 +417,17 @@ _ENVELOPE_REF = 0.28
 _BANDS = ((0, 300), (300, 2000), (2000, 8000))   # 저 / 중 / 고역 (Hz)
 
 
+def _block_level(pcm: bytes) -> float:
+    """오디오 블록 하나의 세기(0~1). 듣는 동안 화면에 흘려보내는 값."""
+    try:
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if not samples.size:
+            return 0.0
+        return float(np.clip(np.sqrt(np.mean(samples * samples)) / _ENVELOPE_REF, 0, 1))
+    except Exception:
+        return 0.0
+
+
 def _envelope(audio, sr: int) -> list[list[float]]:
     """오디오를 프레임별 [전체세기, 저역, 중역, 고역] 목록으로 요약한다. 0~1 범위."""
     try:
@@ -555,6 +566,9 @@ class Jarvis:
         # 대화 한 턴을 처리하는 동안 켜 둔다. 알림은 이게 꺼질 때까지 기다렸다 말한다.
         self._busy = threading.Event()
         self.running = True
+        # 마이크 세기 전송용. 슬롯 하나에 최신 값만 담고 보내는 스레드가 비운다.
+        self._level_slot: "tuple[float, float] | None" = None
+        self._level_wake = threading.Event()
 
     def _init_oww(self):
         """openWakeWord 엔진. 비활성/실패면 None(→ Vosk 폴백)."""
@@ -663,6 +677,9 @@ class Jarvis:
             now = time.time()
 
             prob = self.vad.feed(data)
+            # 듣는 동안 화면이 반응하도록 세기를 흘린다. VAD 확률은 이미 구한 값이라
+            # 덤으로 얹는다 — 목소리일 때만 입자가 크게 튄다.
+            self.hud_level(_block_level(data), prob)
             if prob >= VAD_THRESHOLD:
                 spoke = True
                 last_voice = now
@@ -998,6 +1015,25 @@ class Jarvis:
             return
         self.say(content)
 
+    def hud_level(self, level: float, voice: float) -> None:
+        """듣는 중인 마이크 세기를 HUD 로 흘린다. 0.25초마다 불린다.
+
+        여기서 동기로 POST 하면 오디오 큐를 읽는 루프가 그만큼 막혀 소리를 놓친다.
+        그렇다고 매번 스레드를 띄우면 초당 네 개씩 쌓인다. 보내는 스레드 하나를 두고
+        최신 값만 넘긴다 — 늦은 값은 어차피 화면에서 의미가 없으니 버려도 된다.
+        """
+        self._level_slot = (round(level, 2), round(voice, 2))
+        self._level_wake.set()
+
+    def _level_sender(self) -> None:
+        while self.running:
+            self._level_wake.wait(timeout=1.0)
+            self._level_wake.clear()
+            slot, self._level_slot = self._level_slot, None
+            if slot is None:
+                continue
+            self.hud("listening", level=slot[0], voice=slot[1])
+
     def hud(self, state: str, text: str = "", **extra) -> None:
         """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort.
 
@@ -1044,6 +1080,8 @@ class Jarvis:
             self.hud("idle")
             # 맡겨 둔 작업이 끝나거나 리마인더가 걸리면 여기로 온다. 대기 중에도 듣는다.
             threading.Thread(target=self._notify_listener, daemon=True).start()
+            # 마이크 세기를 화면으로 흘리는 전송기. 녹음 루프를 막지 않게 따로 돈다.
+            threading.Thread(target=self._level_sender, daemon=True).start()
             # 방금 답을 마쳤으면 잠깐은 깨우지 않고 이어 말할 수 있다(시리와 같은 방식).
             follow_up = False
             while True:

@@ -81,6 +81,37 @@ def test_values_stay_in_range(daemon):
     assert env.min() >= 0.0 and env.max() <= 1.0
 
 
+# --- 마이크 세기 ---
+
+
+def test_block_level_separates_silence_from_sound(daemon):
+    quiet = np.zeros(4000, dtype=np.int16).tobytes()
+    t = np.linspace(0, 0.25, 4000, endpoint=False)
+    loud = ((0.5 * np.sin(2 * np.pi * 300 * t)) * 32767).astype(np.int16).tobytes()
+
+    assert daemon._block_level(quiet) == 0.0
+    assert daemon._block_level(loud) > 0.8
+
+
+def test_block_level_survives_junk(daemon):
+    """오디오 한 조각 때문에 녹음이 멈추면 안 된다."""
+    assert daemon._block_level(b"") == 0.0
+    assert daemon._block_level(b"\x01") == 0.0
+
+
+def test_level_slot_keeps_only_the_newest(daemon):
+    """전송이 밀리면 옛 값이 쌓인다. 늦은 세기는 화면에서 의미가 없으니 버려야 한다."""
+    jarvis = daemon.Jarvis.__new__(daemon.Jarvis)
+    jarvis._level_slot = None
+    jarvis._level_wake = daemon.threading.Event()
+
+    jarvis.hud_level(0.1, 0.0)
+    jarvis.hud_level(0.9, 1.0)
+
+    assert jarvis._level_slot == (0.9, 1.0)   # 마지막 것만 남는다
+    assert jarvis._level_wake.is_set()
+
+
 # --- 발화 감지 ---
 
 

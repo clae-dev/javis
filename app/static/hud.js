@@ -21,7 +21,10 @@ const STATUS = {
   speaking: "말하는 중",
   error: "오류",
 };
-const ENERGY = { idle: 0.14, listening: 0.85, thinking: 0.5, speaking: 0.92, error: 0.3 };
+// 소리가 실제로 오는 상태(듣는 중·말하는 중)는 기본값을 낮게 둔다. 여기가 높으면
+// 소리가 끊긴 순간 — 듣는데 아무 말 안 할 때, 문장과 문장 사이 — 오히려 더 크게
+// 부풀어 오른다. 진짜 소리는 아래에서 마이크·포락선이 얹어 준다.
+const ENERGY = { idle: 0.14, listening: 0.18, thinking: 0.5, speaking: 0.3, error: 0.3 };
 
 let state = "idle";
 let color = PALETTE.idle;
@@ -45,6 +48,24 @@ function playEnvelope(frames, frameMs) {
   envelope = frames;
   envelopeFrameMs = frameMs || 33;
   envelopeStart = performance.now();
+}
+
+// 듣는 중 마이크 세기. 0.25초에 한 번씩만 오므로 그대로 쓰면 뚝뚝 끊긴다.
+// 다음 값이 올 때까지 목표값으로 두고 draw() 가 부드럽게 따라가게 한다.
+let micLevel = 0;
+let micVoice = 0;
+let micUntil = 0;
+
+function pushMicLevel(level, voice) {
+  micLevel = level || 0;
+  micVoice = voice || 0;
+  // 말이 끝나 값이 끊기면 스스로 가라앉아야 한다. 안 그러면 마지막 세기로 굳는다.
+  micUntil = performance.now() + 800;
+}
+
+function readMic() {
+  if (performance.now() > micUntil) return null;
+  return [micLevel, micVoice];
 }
 
 function readEnvelope() {
@@ -144,11 +165,19 @@ function drawDust(R) {
 function draw() {
   t += 0.016;
 
-  // 말하는 중이면 실제 목소리 세기를, 아니면 상태별 기본값을 쓴다.
+  // 자비스가 말할 때는 포락선, 사람 말을 듣는 중에는 마이크 세기, 둘 다 없으면
+  // 상태별 기본값. 실제 소리가 있을 때만 입자가 살아 움직인다.
   const frame = readEnvelope();
+  const mic = frame ? null : readMic();
   if (frame) {
     energy += (frame[0] - energy) * 0.5;   // 소리에는 빠르게 붙는다
     for (let i = 0; i < 3; i++) bands[i] += ((frame[i + 1] || 0) - bands[i]) * 0.5;
+  } else if (mic) {
+    // 마이크는 대역을 나눠 오지 않는다. 목소리로 판정된 만큼만 세게 튀도록 섞는다 —
+    // 에어컨 소리에 입자가 춤추면 오히려 거슬린다.
+    const drive = mic[0] * (0.35 + mic[1] * 0.65);
+    energy += (drive - energy) * 0.25;
+    for (let i = 0; i < 3; i++) bands[i] += (drive * 0.8 - bands[i]) * 0.25;
   } else {
     energy += (targetEnergy - energy) * 0.07;
     for (let i = 0; i < 3; i++) bands[i] += (0 - bands[i]) * 0.08;
@@ -304,6 +333,8 @@ function connect() {
       if (m.state) setState(m.state, m.text);
       // 목소리 세기가 같이 왔으면 입자를 거기에 맞춘다. 없으면 상태별 기본 움직임.
       if (m.envelope) playEnvelope(m.envelope, m.frame_ms);
+      // 듣는 중에는 마이크 세기가 0.25초마다 온다.
+      if (m.level !== undefined) pushMicLevel(m.level, m.voice);
     } catch {}
   };
   ws.onclose = (ev) => {

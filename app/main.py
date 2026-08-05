@@ -48,7 +48,22 @@ app.include_router(voice.router)
 app.include_router(ws.router)
 app.include_router(hud.router)
 app.include_router(vision.router)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+class _RevalidatingStatic(StaticFiles):
+    """정적 파일을 캐시하되, 쓰기 전에 서버에 한 번 물어보게 한다.
+
+    기본값으로 두면 브라우저가 옛 CSS·JS 를 그대로 쓴다. 실제로 HUD 를 고친 뒤
+    스타일이 안 먹은 화면을 보고 한참 헤맸다 — 코드는 맞는데 화면만 옛것이라
+    원인을 짐작하기가 어렵다. no-cache 는 '쓰지 말라'가 아니라 '바뀌었는지
+    확인하고 쓰라'는 뜻이라, 안 바뀌었으면 304 로 끝나 비용도 거의 없다.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")

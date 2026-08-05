@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import scheduler
+from app import background, scheduler
 from app.agent.graph import build_graph, make_checkpointer
 from app.agent.runtime import runtime
 from app.api import hud, rest, vision, voice, ws
@@ -26,6 +26,9 @@ async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         checkpointer = await make_checkpointer(stack)
         runtime.graph = build_graph(checkpointer)
+        # 지난번에 돌다 만 작업은 살릴 수 없다. 정리하지 않으면 영원히 '진행 중'으로 남아
+        # 사용자가 오지 않을 결과를 기다리게 된다.
+        await background.clear_stale()
         await scheduler.start()
         if not settings.javis_token:
             log.warning("JAVIS_TOKEN 이 비어 있습니다 — 인증 없이 열립니다. 이 기계 밖에 노출하지 마세요.")

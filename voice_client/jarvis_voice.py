@@ -55,7 +55,12 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 BACKEND = os.environ.get("JAVIS_BACKEND", "http://localhost:8000")
-WS_URL = BACKEND.replace("https", "wss").replace("http", "ws") + "/ws/chat?thread_id=voice"
+_WS_BASE = BACKEND.replace("https", "wss").replace("http", "ws")
+WS_URL = _WS_BASE + "/ws/chat?thread_id=voice"
+# 능동 알림만 듣는 별도 연결. 대화 소켓은 턴 사이에 아무도 읽지 않아서 알림이 갇힌다.
+WS_URL_NOTIFY = _WS_BASE + "/ws/chat?thread_id=voice-notify"
+NOTIFY_TIMEOUT = 60          # recv 타임아웃(초). 지나면 연결 확인만 하고 다시 듣는다.
+NOTIFY_WAIT_MAX = 120        # 대화가 끝나기를 이만큼(초) 기다렸다가 포기한다.
 
 # 백엔드에 JAVIS_TOKEN 이 설정돼 있으면 같은 값을 여기도 넣는다. 비어 있으면 인증 없음.
 TOKEN = os.environ.get("JAVIS_TOKEN", "").strip()
@@ -100,12 +105,16 @@ OWW_THRESHOLD = float(os.environ.get("JAVIS_OWW_THRESHOLD", "0.5"))  # 0~1, 높�
 # 답변이 끝난 뒤 이만큼(초)은 깨우지 않고 바로 이어 말할 수 있다. 0 이면 매번 다시 불러야 한다.
 CONV_TIMEOUT = float(os.environ.get("JAVIS_CONV_TIMEOUT", "10"))
 
-# 첫 덩어리는 로컬 음성(Windows SAPI)으로 즉시 내보낸다. 클라우드 왕복이 빠지는 만큼
-# 첫 소리가 빨라진다. 대신 첫 문장만 목소리가 다르다 — 거슬리면 0 으로 끈다.
-TTS_FIRST_LOCAL = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "1") != "0"
-
 # 운전 모드. 백엔드가 답변을 두세 문장으로 줄인다.
 DRIVE_MODE = os.environ.get("JAVIS_DRIVE", "0") != "0"
+
+# 첫 덩어리를 로컬 음성(Windows SAPI)으로 즉시 내보낼지. 클라우드 왕복이 빠져 첫 소리가
+# 빨라지지만, 첫 문장만 목소리가 달라진다. 목소리로 인격을 만드는 이상 이 불일치는
+# 책상 앞에서 제일 거슬리는 지점이다 — 반대로 차 안에서는 지연이 크고 노면 소음이
+# 차이를 덮어서 이득만 남는다. 그래서 기본은 auto (운전 모드에서만 켬).
+#   auto(기본) / 1(항상) / 0(끔)
+_first_local = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "auto").strip().lower()
+TTS_FIRST_LOCAL = DRIVE_MODE if _first_local == "auto" else _first_local != "0"
 
 # 백엔드 웹소켓은 한 번 붙여 두고 계속 쓴다. 다만 이만큼(초) 놀린 연결은 NAT·방화벽이
 # 조용히 끊어 놓았을 수 있어, 쓰기 전에 새로 붙는다. 죽은 소켓에 보내면 살아 있는 줄
@@ -393,6 +402,11 @@ class Jarvis:
         self.oww = self._init_oww()
         self.ws: "websocket.WebSocket | None" = None
         self._ws_used = 0.0
+        # 스피커는 하나뿐이다. 알림 스레드와 응답 재생이 동시에 울리지 않게 직렬화한다.
+        self._speak_lock = threading.Lock()
+        # 대화 한 턴을 처리하는 동안 켜 둔다. 알림은 이게 꺼질 때까지 기다렸다 말한다.
+        self._busy = threading.Event()
+        self.running = True
 
     def _init_oww(self):
         """openWakeWord 엔진. 비활성/실패면 None(→ Vosk 폴백)."""
@@ -660,6 +674,8 @@ class Jarvis:
                     reply = "처리 중에 문제가 생겼어: " + msg.get("message", "")
                     speak_q.put(reply)
                     break
+                # proactive 는 일부러 흘려보낸다. 능동 알림은 전용 리스너가 맡는다 —
+                # 여기서도 처리하면 같은 알림을 두 번 말하게 된다.
             self._ws_used = time.time()  # 끝까지 정상으로 받았다 = 다음 턴에 재사용 가능
         except Exception:
             self._close_ws()  # 중간에 끊긴 연결은 상태가 어긋나 있다. 다음 턴에 새로 붙는다.
@@ -700,13 +716,15 @@ class Jarvis:
             return None
 
     def _tts_play(self, audio, sr) -> None:
-        try:
-            sd.play(audio, sr, device=self.out_dev)
-            sd.wait()
-        except Exception as exc:
-            print("  (재생 실패)", exc)
-        finally:
-            self._flush()  # 자기 목소리가 다음 입력에 섞이지 않게
+        # 알림 스레드가 끼어들어 응답 위에 겹쳐 울리는 걸 막는다.
+        with self._speak_lock:
+            try:
+                sd.play(audio, sr, device=self.out_dev)
+                sd.wait()
+            except Exception as exc:
+                print("  (재생 실패)", exc)
+            finally:
+                self._flush()  # 자기 목소리가 다음 입력에 섞이지 않게
 
     def say(self, text: str) -> None:
         """한 덩어리 텍스트를 합성해 바로 재생한다 (확인 질문 등 단발 용)."""
@@ -738,6 +756,57 @@ class Jarvis:
         sd.play(tone, SAMPLE_RATE, device=self.out_dev)
         sd.wait()
 
+    # --- 능동 알림 ---
+    #
+    # 맡겨 둔 작업이 끝나거나 리마인더가 걸리면 백엔드가 연결된 모든 채팅 소켓으로
+    # 알림을 밀어 준다. 문제는 턴 사이에 그 소켓을 아무도 읽지 않는다는 것 — 다음에
+    # 말을 걸 때까지 알림이 버퍼에 갇힌다. 그래서 듣기만 하는 연결을 따로 하나 둔다.
+    # (대화 소켓에도 같은 알림이 오지만 _converse 는 그냥 흘려보낸다. 양쪽에서 처리하면
+    #  같은 알림을 두 번 말하게 된다.)
+
+    def _notify_listener(self) -> None:
+        while self.running:
+            try:
+                ws = websocket.create_connection(WS_URL_NOTIFY, timeout=NOTIFY_TIMEOUT)
+                if TOKEN:
+                    ws.send(json.dumps({"token": TOKEN}))
+            except Exception:
+                time.sleep(5)
+                continue
+
+            try:
+                while self.running:
+                    try:
+                        msg = json.loads(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue  # 조용한 시간. 연결은 살아 있다.
+                    if (msg or {}).get("type") != "proactive":
+                        continue
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        self._announce(content)
+            except Exception:
+                pass  # 끊겼다. 위에서 다시 붙는다.
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            time.sleep(3)
+
+    def _announce(self, content: str) -> None:
+        """알림을 말한다. 대화 중이면 끝날 때까지 기다린다."""
+        print(f"\n[알림] {content}", flush=True)
+        # 말하는 중에 끼어들면 사용자 대화를 덮어쓴다. 잠깐이면 기다리고, 너무 길어지면
+        # 화면에는 이미 찍혔으니 음성은 포기한다.
+        for _ in range(int(NOTIFY_WAIT_MAX)):
+            if not self._busy.is_set():
+                break
+            time.sleep(1)
+        else:
+            return
+        self.say(content)
+
     def hud(self, state: str, text: str = "") -> None:
         """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort."""
         try:
@@ -767,10 +836,19 @@ class Jarvis:
             print(f"대기 중… {wake_hint}. (종료: Ctrl+C)", flush=True)
             if DRIVE_MODE:
                 print("운전 모드: 답변을 짧게 합니다.", flush=True)
+            # 첫 문장 목소리가 달라지는 건 눈치채기 어렵고 원인 찾기는 더 어렵다. 밝혀 둔다.
+            print(
+                "첫 덩어리 합성: "
+                + ("로컬(빠름, 첫 문장만 목소리 다름)" if TTS_FIRST_LOCAL else "클라우드(목소리 일관)"),
+                flush=True,
+            )
             self.hud("idle")
+            # 맡겨 둔 작업이 끝나거나 리마인더가 걸리면 여기로 온다. 대기 중에도 듣는다.
+            threading.Thread(target=self._notify_listener, daemon=True).start()
             # 방금 답을 마쳤으면 잠깐은 깨우지 않고 이어 말할 수 있다(시리와 같은 방식).
             follow_up = False
             while True:
+                self._busy.clear()  # 여기서부터는 조용하다. 알림이 끼어들어도 된다.
                 if follow_up:
                     # 깨움 신호도 띵 소리도 없이 곧장 듣는다. 침묵하면 다시 대기로 돌아간다.
                     pcm, spoke = self.record_utterance(
@@ -794,6 +872,7 @@ class Jarvis:
                         self.hud("idle")
                         continue
                 follow_up = False  # 아래에서 답을 마쳤을 때만 다시 켠다
+                self._busy.set()   # 여기부터 답을 마칠 때까지 알림은 기다린다
                 try:
                     text = self.stt(pcm)
                 except Exception as exc:
@@ -834,6 +913,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n종료합니다.")
     finally:
+        daemon.running = False  # 알림 리스너도 같이 내려간다
         daemon._close_ws()
 
 

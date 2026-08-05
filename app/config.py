@@ -34,9 +34,21 @@ class Settings(BaseSettings):
     # 5 에 비해 디코딩이 눈에 띄게 빠르다. 잘 못 알아들으면 올린다.
     stt_local_beam: int = 1
     tts_model: str = "gpt-4o-mini-tts"
-    tts_voice: str = "alloy"
-    # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 음성에 감정을 싣는다.
-    tts_instructions: str = "따뜻하고 다정한 친구 같은 말투로, 자연스러운 한국어 억양과 감정을 담아 말해줘."
+    # 목소리가 인격의 절반이다. onyx 는 낮고 차분해서 자비스 인상에 가깝다.
+    # 취향에 따라 ash(단단함) / sage(부드러움) 로 바꾼다.
+    tts_voice: str = "onyx"
+    # gpt-4o-*-tts 계열에서만 먹는 톤 지시. 같은 목소리도 이 문장으로 인상이 꽤 달라진다.
+    tts_instructions: str = (
+        "침착하고 절제된 집사의 말투로, 낮고 또렷하게. 과장하거나 호들갑 떨지 말고 "
+        "필요한 말만 정확히 전한다. 다만 차갑지는 않게 — 오래 곁을 지킨 사람의 온도로. "
+        "자연스러운 한국어 억양을 지킨다."
+    )
+    # 음성 합성 제공자. openai 는 목소리 복제가 안 된다 — 복제한 목소리를 쓰려면
+    # elevenlabs 로 바꾸고 키와 voice id 를 넣는다(키가 없으면 openai 로 되돌아간다).
+    tts_provider: str = "openai"
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = ""
+    elevenlabs_model: str = "eleven_multilingual_v2"
 
     # 외부 검색 (없으면 ddgs 폴백)
     tavily_api_key: str = ""
@@ -80,6 +92,9 @@ class Settings(BaseSettings):
     # 문자를 '작성만' 할지 '보내기까지' 할지. 자동 전송은 메시지 앱 화면 구성에 기대는
     # 방식이라 기기에 따라 안 먹을 수 있다. 기본은 작성까지만.
     android_sms_autosend: bool = False
+    # 전화도 같은 태도. 기본은 다이얼러에 번호만 채우고 통화 버튼은 사람이 누른다.
+    # 운전 중처럼 화면을 못 볼 때만 켠다 — 잘못 걸면 되돌릴 수 없다.
+    android_call_autodial: bool = False
 
     # 브라우저 자동화 (Playwright). 로그인 세션을 유지하려고 프로필을 한곳에 둔다.
     browser_user_data_dir: str = "credentials/browser"

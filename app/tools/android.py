@@ -5,6 +5,7 @@
 
 문자는 기본적으로 '작성까지만' 한다. 자동 전송은 메시지 앱 화면 구성에 기대는 방식이라
 기기에 따라 엉뚱한 버튼을 누를 수 있어서, ANDROID_SMS_AUTOSEND 로 따로 켜야 동작한다.
+전화도 같은 태도다 — 기본은 다이얼러에 번호만 채우고, 통화 버튼은 사람이 누른다.
 """
 
 import asyncio
@@ -280,3 +281,33 @@ async def send_sms(to: str, body: str) -> str:
             return f"문자는 작성됐지만 전송은 실패했습니다({err}). 폰에서 직접 눌러 주세요."
         await asyncio.sleep(0.4)
     return f"{number} 앞으로 문자를 보냈습니다. (폰 화면에서 전송됐는지 한 번 확인해 주세요.)"
+
+
+@tool
+async def place_call(to: str) -> str:
+    """폰으로 전화를 건다. 실행 전 사용자 확인을 거친다.
+
+    기본은 다이얼러에 번호만 채우는 것까지라, 마지막 통화 버튼은 사람이 누른다.
+    운전 중처럼 화면을 못 볼 때 바로 걸리게 하려면 ANDROID_CALL_AUTODIAL 을 켠다.
+
+    Args:
+        to: 전화번호. 하이픈이 섞여 있어도 된다.
+    """
+    number = re.sub(r"[^\d+]", "", to)
+    if not number:
+        return "전화번호를 알아보지 못했습니다."
+
+    # DIAL 은 번호만 채우고 멈춘다. CALL 은 바로 건다 — 잘못 걸면 되돌릴 수 없어서
+    # 문자와 같은 이유로 기본값을 안전한 쪽에 둔다.
+    action = "CALL" if settings.android_call_autodial else "DIAL"
+    cmd = (
+        f"am start -a android.intent.action.{action} "
+        f"-d {shlex.quote('tel:' + number)}"
+    )
+    _, err = await _shell(cmd)
+    if err:
+        return err
+
+    if not settings.android_call_autodial:
+        return f"{number} 을(를) 다이얼러에 띄워 뒀습니다. 폰에서 통화 버튼만 눌러 주세요."
+    return f"{number} 으로 전화를 걸었습니다."

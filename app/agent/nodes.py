@@ -83,16 +83,21 @@ async def prepare(state: JarvisState, config: RunnableConfig) -> dict:
     return {"user_profile": profile, "retrieved_context": context, "mood": mood}
 
 
-# 도구 바인딩은 11개 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번
-# 도는 걸 감안해 한 번만 묶어 재사용한다(온기를 살짝 주되 도구 신뢰성은 지키는 온도).
-_agent_llm = None
+# 도구 바인딩은 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번 도는 걸
+# 감안해 한 번만 묶어 재사용한다(온기를 살짝 주되 도구 신뢰성은 지키는 온도).
+_agent_llm: dict[bool, object] = {}
+
+# 사람 없이 도는 실행에서는 빼는 도구. 맡겨 둔 작업 안에서 또 작업을 맡기면 아무도
+# 일을 하지 않는다 — 실제로 첫 실행에서 이렇게 돌았다. 프롬프트로 타이르는 것보다
+# 목록에서 빼는 쪽이 확실하다.
+_HEADLESS_EXCLUDED = {"start_background_task"}
 
 
-def _get_agent_llm():
-    global _agent_llm
-    if _agent_llm is None:
-        _agent_llm = chat(streaming=True, temperature=0.5).bind_tools(TOOLS)
-    return _agent_llm
+def _get_agent_llm(headless: bool = False):
+    if headless not in _agent_llm:
+        tools = [t for t in TOOLS if t.name not in _HEADLESS_EXCLUDED] if headless else TOOLS
+        _agent_llm[headless] = chat(streaming=True, temperature=0.5).bind_tools(tools)
+    return _agent_llm[headless]
 
 
 # 반사 단계에서 기억과 감정을 추출할 때 쓸 LLM 바인딩. Pydantic 스키마 컴파일은 비싸므로
@@ -109,7 +114,9 @@ def _get_reflection_extractor():
 
 async def agent(state: JarvisState) -> dict:
     system = SystemMessage(content=build_system_prompt(state))
-    response = await _get_agent_llm().ainvoke([system, *state["messages"]])
+    response = await _get_agent_llm(bool(state.get("headless"))).ainvoke(
+        [system, *state["messages"]]
+    )
     return {"messages": [response]}
 
 

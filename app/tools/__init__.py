@@ -9,6 +9,7 @@ from app.tools.android import (
     android_screenshot,
     list_android_notifications,
     open_android_app,
+    place_call,
     send_sms,
 )
 from app.tools.browser import browse, browse_extract, browser_act
@@ -28,6 +29,7 @@ from app.tools.notes import (
 from app.tools.reminders import complete_reminder, create_reminder, list_reminders
 from app.tools.schedules import create_schedule, delete_schedule, list_schedules
 from app.tools.search import web_search
+from app.tools.tasks import list_background_tasks, start_background_task
 from app.tools.vision import look, who_is_here
 from app.tools.youtube import get_video_stats, list_channel_videos, search_youtube
 
@@ -47,6 +49,8 @@ TOOLS = [
     create_schedule,
     list_schedules,
     delete_schedule,
+    start_background_task,
+    list_background_tasks,
     get_upcoming_events,
     create_event,
     list_recent_emails,
@@ -60,6 +64,7 @@ TOOLS = [
     android_media,
     android_screenshot,
     send_sms,
+    place_call,
     browse,
     browse_extract,
     browser_act,
@@ -81,9 +86,13 @@ WRITE_TOOLS = {
     "edit_project",
     "set_hue_light",
     "send_sms",
+    "place_call",
     "append_note",
     "browser_act",
     # 한 번 걸면 계속 도는 규칙이라, 만들고 지울 때 확인을 거친다.
     "create_schedule",
     "delete_schedule",
+    # 맡긴 일은 몇 분씩 실제 비용을 쓰며 돈다. 안에서 쓰기 도구는 어차피 막히지만,
+    # 시작 자체를 한 번 묻는다. 매번 묻는 게 성가시면 이 줄만 빼면 된다.
+    "start_background_task",
 }

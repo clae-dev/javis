@@ -169,6 +169,31 @@ async def browse(url: str) -> str:
 
 
 @tool
+async def show_on_screen(url: str) -> str:
+    """웹페이지를 HUD 화면에 띄워 실시간으로 보여준다. 내용을 읽어 오지는 않는다.
+
+    "이거 화면에 띄워 줘", "지금 뭐 보고 있는지 보여 줘" 처럼 사람이 눈으로 봐야 할 때
+    쓴다. 내용을 읽고 답해야 하는 거라면 browse 가 맞다.
+
+    Args:
+        url: 띄울 주소 (http 또는 https).
+    """
+    if err := _check_url(url):
+        return err
+    from app import browser_feed
+
+    return await browser_feed.start(url)
+
+
+@tool
+async def hide_from_screen() -> str:
+    """HUD 화면에 띄워 둔 웹페이지를 내린다."""
+    from app import browser_feed
+
+    return await browser_feed.stop()
+
+
+@tool
 async def browse_extract(url: str, selector: str, attribute: str = "") -> str:
     """웹페이지에서 CSS 선택자에 맞는 요소들을 뽑는다. 목록·표를 긁을 때 쓴다.
 

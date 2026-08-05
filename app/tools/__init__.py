@@ -12,7 +12,13 @@ from app.tools.android import (
     place_call,
     send_sms,
 )
-from app.tools.browser import browse, browse_extract, browser_act
+from app.tools.browser import (
+    browse,
+    browse_extract,
+    browser_act,
+    hide_from_screen,
+    show_on_screen,
+)
 from app.tools.builtin import get_current_time, recall, remember
 from app.tools.calendar import create_event, get_upcoming_events
 from app.tools.code import ask_project, edit_project
@@ -68,6 +74,8 @@ TOOLS = [
     browse,
     browse_extract,
     browser_act,
+    show_on_screen,
+    hide_from_screen,
     search_youtube,
     get_video_stats,
     list_channel_videos,

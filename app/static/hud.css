@@ -101,3 +101,21 @@ body { transition: background .6s ease; }
 body[data-state="listening"] { background: radial-gradient(ellipse at center, #0a1822 0%, var(--bg) 70%); }
 body[data-state="speaking"]  { background: radial-gradient(ellipse at center, #07160f 0%, var(--bg) 70%); }
 body[data-state="thinking"]  { background: radial-gradient(ellipse at center, #14110a 0%, var(--bg) 70%); }
+
+/* 브라우저 화면 — 자비스가 지금 보고 있는 페이지. 왼쪽 아래 구석에 작게. */
+.browser-feed {
+  position: fixed; left: 22px; bottom: 22px;
+  width: min(30vw, 380px);
+  border: 1px solid rgba(90, 200, 255, .28);
+  border-radius: 10px; overflow: hidden;
+  background: rgba(6, 14, 20, .78);
+  box-shadow: 0 0 30px rgba(0, 0, 0, .55);
+  opacity: .92;
+}
+.browser-feed img { display: block; width: 100%; }
+.browser-feed span {
+  display: block; padding: 5px 9px;
+  font-size: 11px; color: #7fb6c9;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-top: 1px solid rgba(90, 200, 255, .16);
+}

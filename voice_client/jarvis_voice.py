@@ -155,6 +155,98 @@ def ensure_model() -> str:
     return str(MODEL_PATH)
 
 
+# --- 발화 종료 감지 (Silero VAD) ---
+#
+# 종료 판정을 인식기에 맡기면(Vosk 부분 결과가 안 자라면 끝난 걸로) 인식이 흔들릴 때
+# 같이 흔들린다. 조용히 말하거나 시끄러운 데서 말이 끊기거나 안 끊긴다. 소리에 사람
+# 목소리가 있는지만 보는 전용 모델을 쓰면 인식 성능과 분리된다.
+#
+# 파이썬 패키지(silero-vad)는 torch 를 끌어온다(윈도우 CPU 빌드 ~2GB). ONNX 모델
+# 하나(2.3MB)를 onnxruntime 으로 직접 돌리면 그럴 필요가 없다 — onnxruntime 은
+# openWakeWord 가 이미 가져다 놨다.
+VAD_MODEL_URL = (
+    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+)
+VAD_MODEL_PATH = MODEL_DIR / "silero_vad.onnx"
+
+VAD_ENABLE = os.environ.get("JAVIS_VAD", "1") != "0"
+# 이 확률 이상이면 사람이 말하는 중으로 본다.
+VAD_THRESHOLD = float(os.environ.get("JAVIS_VAD_THRESHOLD", "0.5"))
+
+_VAD_CHUNK = 512      # v5 는 16kHz 에서 이 크기로만 판정한다
+_VAD_CONTEXT = 64     # 직전 청크 꼬리를 앞에 붙여 넣어야 한다(576 샘플). 없으면 전부 0 이 나온다.
+
+
+def ensure_vad_model() -> Path | None:
+    """VAD 모델을 준비한다. 못 받으면 None (Vosk 방식으로 폴백)."""
+    if VAD_MODEL_PATH.exists() and VAD_MODEL_PATH.stat().st_size > 100_000:
+        return VAD_MODEL_PATH
+    try:
+        print("음성 감지 모델 다운로드 중 (~2MB, 최초 1회)…", flush=True)
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = VAD_MODEL_PATH.with_suffix(".part")
+        with requests.get(VAD_MODEL_URL, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    f.write(chunk)
+        tmp.replace(VAD_MODEL_PATH)
+        return VAD_MODEL_PATH
+    except Exception as exc:
+        print("음성 감지 모델을 받지 못했습니다(Vosk 방식으로 진행):", exc, flush=True)
+        return None
+
+
+class VoiceDetector:
+    """오디오 조각을 먹여 '지금 사람이 말하고 있는지' 확률을 받는다."""
+
+    def __init__(self, session) -> None:
+        self._sess = session
+        self._sr = np.array(SAMPLE_RATE, dtype=np.int64)
+        self.reset()
+
+    @staticmethod
+    def create() -> "VoiceDetector | None":
+        """쓸 수 있으면 만들고, 아니면 None. 여기서 실패해도 데몬은 그대로 돈다."""
+        if not VAD_ENABLE:
+            return None
+        path = ensure_vad_model()
+        if path is None:
+            return None
+        try:
+            import onnxruntime as ort
+
+            sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            return VoiceDetector(sess)
+        except Exception as exc:
+            print("음성 감지 초기화 실패(Vosk 방식으로 진행):", exc, flush=True)
+            return None
+
+    def reset(self) -> None:
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(_VAD_CONTEXT, dtype=np.float32)
+        self._left = np.empty(0, dtype=np.float32)
+
+    def feed(self, pcm: bytes) -> float:
+        """이 조각에서 나온 확률 중 가장 높은 값. 조각이 짧으면 직전 값을 이어 쓴다."""
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        self._left = np.concatenate([self._left, samples])
+
+        best = 0.0
+        while len(self._left) >= _VAD_CHUNK:
+            chunk, self._left = self._left[:_VAD_CHUNK], self._left[_VAD_CHUNK:]
+            frame = np.concatenate([self._context, chunk]).reshape(1, -1)
+            try:
+                out, self._state = self._sess.run(
+                    None, {"input": frame, "state": self._state, "sr": self._sr}
+                )
+            except Exception:
+                return best
+            self._context = chunk[-_VAD_CONTEXT:]
+            best = max(best, float(out[0][0]))
+        return best
+
+
 def _norm(text: str) -> str:
     return text.replace(" ", "").lower()
 
@@ -314,6 +406,61 @@ def _tts_local(text: str):
     return _local_tts.synth(text) if _local_tts is not None else None
 
 
+# HUD 입자가 목소리에 맞춰 움직이려면 소리의 세기를 알아야 한다. 오디오 자체를
+# 브라우저로 넘기는 방법도 있지만(원본이 그렇게 한다), 그러면 재생 주체가 화면이 되어
+# 운전 중이나 화면 없이 쓸 때가 깨진다. 대신 여기서 세기만 뽑아 숫자로 넘긴다.
+ENVELOPE_FRAME_MS = 33          # ~30fps. 눈으로는 이보다 촘촘해도 차이를 못 느낀다.
+_ENVELOPE_MAX_FRAMES = 900      # 30초어치. 그보다 긴 클립은 뒤를 자른다(전송량 상한).
+# 이 진폭을 '가득 찬 소리'로 본다. 클립마다 최대값으로 정규화하면 조용한 한마디가
+# 고함처럼 보인다 — 고정 기준을 써야 크게 말할 때 실제로 커진다.
+_ENVELOPE_REF = 0.28
+_BANDS = ((0, 300), (300, 2000), (2000, 8000))   # 저 / 중 / 고역 (Hz)
+
+
+def _envelope(audio, sr: int) -> list[list[float]]:
+    """오디오를 프레임별 [전체세기, 저역, 중역, 고역] 목록으로 요약한다. 0~1 범위."""
+    try:
+        data = np.asarray(audio, dtype=np.float32)
+        if data.ndim > 1:            # 스테레오면 모노로 접는다
+            data = data.mean(axis=1)
+        step = max(1, int(sr * ENVELOPE_FRAME_MS / 1000))
+        frames = min(len(data) // step, _ENVELOPE_MAX_FRAMES)
+        if frames <= 0:
+            return []
+
+        # (frames, step) 으로 잘라 한 번에 계산한다. 프레임마다 파이썬 루프를 돌면
+        # 긴 문장에서 눈에 띄게 느려진다.
+        block = data[: frames * step].reshape(frames, step)
+        window = np.hanning(step).astype(np.float32)
+        spectrum = np.abs(np.fft.rfft(block * window, axis=1))
+        freqs = np.fft.rfftfreq(step, 1 / sr)
+
+        rms = np.sqrt(np.mean(block * block, axis=1))
+        level = np.clip(rms / _ENVELOPE_REF, 0, 1)
+        out = [level]
+
+        # 대역은 '이 순간 소리의 몇 할이 이 대역인가' 로 낸다. 대역 안 성분을 평균 내면
+        # 넓은 대역일수록 값이 희석돼(고역은 대역폭이 저역의 20배다) 순수한 고음조차
+        # 0에 가깝게 나온다. 에너지 비율로 내면 대역폭과 무관해지고, 거기에 전체 세기를
+        # 곱하니 조용할 때는 모든 대역이 같이 가라앉는다.
+        power = spectrum ** 2
+        total = power.sum(axis=1) + 1e-9
+        for low, high in _BANDS:
+            sel = (freqs >= low) & (freqs < high)
+            if not sel.any():
+                out.append(np.zeros(frames, dtype=np.float32))
+                continue
+            share = np.sqrt(power[:, sel].sum(axis=1) / total)
+            out.append(np.clip(share * level, 0, 1))
+
+        # 소수점 둘째 자리면 눈으로 구분이 안 된다. JSON 크기를 절반으로 줄인다.
+        return np.round(np.stack(out, axis=1), 2).tolist()
+    except Exception as exc:
+        if DEBUG:
+            print("  (포락선 계산 실패)", exc, flush=True)
+        return []
+
+
 def pcm_to_wav(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -400,6 +547,7 @@ class Jarvis:
             callback=self._on_audio,
         )
         self.oww = self._init_oww()
+        self.vad = VoiceDetector.create()
         self.ws: "websocket.WebSocket | None" = None
         self._ws_used = 0.0
         # 스피커는 하나뿐이다. 알림 스레드와 응답 재생이 동시에 울리지 않게 직렬화한다.
@@ -495,9 +643,40 @@ class Jarvis:
     def record_utterance(self, max_seconds: float = 12.0, initial_silence: float = 6.0) -> tuple[bytes, bool]:
         """말이 끝날 때까지 녹음. (오디오, 말했는지) 반환.
 
-        Vosk 내부 확정만 기다리면 끝이 늦게 잡혀 응답이 느려 보인다. 그래서 부분 인식이
-        END_SILENCE 동안 더 안 자라면(=말이 멈춤) 바로 종료한다.
+        목소리가 들리는지는 VAD 가 판정한다. 인식기(Vosk)에 맡기면 인식이 흔들릴 때
+        종료 판정도 같이 흔들린다 — 조용히 말하면 안 끝나고, 시끄러우면 중간에 끊긴다.
+        VAD 를 못 쓰면 예전처럼 Vosk 부분 결과가 자라는지로 판정한다.
         """
+        if self.vad is not None:
+            return self._record_with_vad(max_seconds, initial_silence)
+        return self._record_with_vosk(max_seconds, initial_silence)
+
+    def _record_with_vad(self, max_seconds: float, initial_silence: float) -> tuple[bytes, bool]:
+        self.vad.reset()
+        self._flush()
+        frames = bytearray()
+        spoke = False
+        start = last_voice = time.time()
+        while time.time() - start < max_seconds:
+            data = self.q.get()
+            frames += data
+            now = time.time()
+
+            prob = self.vad.feed(data)
+            if prob >= VAD_THRESHOLD:
+                spoke = True
+                last_voice = now
+                if DEBUG:
+                    print(f"  [vad] {prob:.2f}", flush=True)
+
+            if not spoke and now - start > initial_silence:
+                break
+            if spoke and now - last_voice > END_SILENCE:  # 말 멈춘 뒤 짧은 침묵 → 종료
+                break
+        return bytes(frames), spoke
+
+    def _record_with_vosk(self, max_seconds: float, initial_silence: float) -> tuple[bytes, bool]:
+        """VAD 없이 돌던 예전 방식. 부분 인식이 더 안 자라면 끝난 걸로 본다."""
         rec = KaldiRecognizer(self.model, SAMPLE_RATE)
         self._flush()
         frames = bytearray()
@@ -716,6 +895,18 @@ class Jarvis:
             return None
 
     def _tts_play(self, audio, sr) -> None:
+        # 재생 직전에 포락선을 계산해 HUD 로 한 번 보낸다. 프레임마다 보내면 초당 수십 번
+        # 왕복이 나가고, 그 왕복이 재생 스레드를 막는다. 클립 전체를 한 번에 넘기고
+        # 화면이 자기 시계로 따라 그리게 하면 왕복은 1회로 끝난다.
+        envelope = _envelope(audio, sr)
+        # 전송이 재생을 늦추면 안 된다 — 띄워 놓고 바로 소리부터 낸다.
+        threading.Thread(
+            target=self.hud,
+            args=("speaking",),
+            kwargs={"envelope": envelope, "frame_ms": ENVELOPE_FRAME_MS},
+            daemon=True,
+        ).start()
+
         # 알림 스레드가 끼어들어 응답 위에 겹쳐 울리는 걸 막는다.
         with self._speak_lock:
             try:
@@ -807,14 +998,18 @@ class Jarvis:
             return
         self.say(content)
 
-    def hud(self, state: str, text: str = "") -> None:
-        """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort."""
+    def hud(self, state: str, text: str = "", **extra) -> None:
+        """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort.
+
+        extra 는 그대로 실려 화면까지 간다(예: 목소리 포락선). 서버는 payload 를
+        통째로 브로드캐스트하므로 필드를 늘려도 백엔드는 손댈 게 없다.
+        """
         try:
             requests.post(
                 f"{BACKEND}/hud/event",
-                json={"state": state, "text": text},
+                json={"state": state, "text": text, **extra},
                 headers=AUTH_HEADERS,
-                timeout=2,
+                timeout=5,
             )
         except Exception:
             pass
@@ -840,6 +1035,10 @@ class Jarvis:
             print(
                 "첫 덩어리 합성: "
                 + ("로컬(빠름, 첫 문장만 목소리 다름)" if TTS_FIRST_LOCAL else "클라우드(목소리 일관)"),
+                flush=True,
+            )
+            print(
+                "발화 종료 감지: " + ("VAD(Silero)" if self.vad is not None else "Vosk 부분 인식"),
                 flush=True,
             )
             self.hud("idle")

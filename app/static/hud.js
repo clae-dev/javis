@@ -21,13 +21,63 @@ const STATUS = {
   speaking: "말하는 중",
   error: "오류",
 };
-const ENERGY = { idle: 0.14, listening: 0.85, thinking: 0.5, speaking: 0.92, error: 0.3 };
+// 소리가 실제로 오는 상태(듣는 중·말하는 중)는 기본값을 낮게 둔다. 여기가 높으면
+// 소리가 끊긴 순간 — 듣는데 아무 말 안 할 때, 문장과 문장 사이 — 오히려 더 크게
+// 부풀어 오른다. 진짜 소리는 아래에서 마이크·포락선이 얹어 준다.
+const ENERGY = { idle: 0.14, listening: 0.18, thinking: 0.5, speaking: 0.3, error: 0.3 };
 
 let state = "idle";
 let color = PALETTE.idle;
 let energy = 0.14;
 let targetEnergy = 0.14;
 let t = 0;
+// 목소리 대역별 세기 (저/중/고). 포락선이 올 때만 채워진다.
+let bands = [0, 0, 0];
+
+// --- 목소리 포락선 ---
+//
+// 음성 데몬이 말하기 직전에 클립 전체의 세기를 프레임 목록으로 보내 준다. 오디오
+// 자체는 오지 않는다 — 소리는 데스크톱 스피커에서 나고, 화면은 숫자만 받아 따라
+// 그린다. 그래서 여기서는 '언제 시작했는지'만 알고 자기 시계로 훑으면 된다.
+let envelope = null;
+let envelopeFrameMs = 33;
+let envelopeStart = 0;
+
+function playEnvelope(frames, frameMs) {
+  if (!Array.isArray(frames) || !frames.length) return;
+  envelope = frames;
+  envelopeFrameMs = frameMs || 33;
+  envelopeStart = performance.now();
+}
+
+// 듣는 중 마이크 세기. 0.25초에 한 번씩만 오므로 그대로 쓰면 뚝뚝 끊긴다.
+// 다음 값이 올 때까지 목표값으로 두고 draw() 가 부드럽게 따라가게 한다.
+let micLevel = 0;
+let micVoice = 0;
+let micUntil = 0;
+
+function pushMicLevel(level, voice) {
+  micLevel = level || 0;
+  micVoice = voice || 0;
+  // 말이 끝나 값이 끊기면 스스로 가라앉아야 한다. 안 그러면 마지막 세기로 굳는다.
+  micUntil = performance.now() + 800;
+}
+
+function readMic() {
+  if (performance.now() > micUntil) return null;
+  return [micLevel, micVoice];
+}
+
+function readEnvelope() {
+  if (!envelope) return null;
+  const i = Math.floor((performance.now() - envelopeStart) / envelopeFrameMs);
+  if (i < 0) return null;
+  if (i >= envelope.length) {
+    envelope = null; // 다 재생했다. 다음 클립까지는 상태별 기본값으로 돌아간다.
+    return null;
+  }
+  return envelope[i];
+}
 
 // --- 캔버스 크기 ---
 let dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -72,10 +122,66 @@ function typeReply(text) {
   }, 22);
 }
 
+// --- 입자 ---
+//
+// 상태별로 색과 움직임이 달라지고, 자비스가 말할 때는 목소리 세기에 맞춰 밀려났다
+// 돌아온다. 링만 있을 때보다 '살아 있다'는 느낌이 크다. 입자는 한 번만 만들고
+// 계속 재사용한다 — 매 프레임 새로 만들면 GC 가 프레임을 잡아먹는다.
+const PARTICLES = 420;
+const dust = Array.from({ length: PARTICLES }, () => ({
+  a: Math.random() * Math.PI * 2,          // 각도
+  r: 0.55 + Math.random() * 1.15,          // 반지름 (R 배수)
+  size: 0.6 + Math.random() * 1.6,
+  drift: (Math.random() - 0.5) * 0.35,     // 각속도 — 제각각이라야 흐르는 것처럼 보인다
+  phase: Math.random() * Math.PI * 2,      // 숨쉬기 위상
+  push: 0,                                 // 소리에 밀려난 정도. 천천히 되돌아온다
+  band: Math.floor(Math.random() * 3),     // 이 입자가 반응할 대역
+}));
+
+function drawDust(R) {
+  ctx.fillStyle = color;
+  for (const p of dust) {
+    // 대역별로 다르게 밀어야 목소리의 결이 보인다. 전부 같이 움직이면 그냥 깜빡임이다.
+    // 실제 말소리는 대역 값이 0.2 를 넘는 일이 드물어서(저역 우세, 고역은 0.01 언저리)
+    // 그대로 쓰면 거의 안 움직인다. 눈에 보이는 범위로 늘려 준다.
+    const target = Math.min(1.1, bands[p.band] * 2.6 + energy * 0.8);
+    p.push += (target - p.push) * 0.25;
+    p.a += p.drift * 0.004 * (1 + energy);
+
+    const breathe = 1 + 0.05 * Math.sin(t * 1.4 + p.phase);
+    const rr = R * (p.r * breathe + p.push * 1.15);
+    const x = Math.cos(p.a) * rr;
+    const y = Math.sin(p.a) * rr;
+
+    // 멀리 밀려난 입자일수록 옅게 — 퍼져 나가 사라지는 인상을 준다.
+    ctx.globalAlpha = Math.max(0, Math.min(0.95, (0.3 + p.push * 0.8) * (1 - p.push * 0.3)));
+    ctx.beginPath();
+    ctx.arc(x, y, dpr * p.size * (1.0 + p.push * 0.9), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 // --- 리액터 그리기 ---
 function draw() {
   t += 0.016;
-  energy += (targetEnergy - energy) * 0.07;
+
+  // 자비스가 말할 때는 포락선, 사람 말을 듣는 중에는 마이크 세기, 둘 다 없으면
+  // 상태별 기본값. 실제 소리가 있을 때만 입자가 살아 움직인다.
+  const frame = readEnvelope();
+  const mic = frame ? null : readMic();
+  if (frame) {
+    energy += (frame[0] - energy) * 0.5;   // 소리에는 빠르게 붙는다
+    for (let i = 0; i < 3; i++) bands[i] += ((frame[i + 1] || 0) - bands[i]) * 0.5;
+  } else if (mic) {
+    // 마이크는 대역을 나눠 오지 않는다. 목소리로 판정된 만큼만 세게 튀도록 섞는다 —
+    // 에어컨 소리에 입자가 춤추면 오히려 거슬린다.
+    const drive = mic[0] * (0.35 + mic[1] * 0.65);
+    energy += (drive - energy) * 0.25;
+    for (let i = 0; i < 3; i++) bands[i] += (drive * 0.8 - bands[i]) * 0.25;
+  } else {
+    energy += (targetEnergy - energy) * 0.07;
+    for (let i = 0; i < 3; i++) bands[i] += (0 - bands[i]) * 0.08;
+  }
 
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
@@ -85,6 +191,9 @@ function draw() {
 
   ctx.save();
   ctx.translate(cx, cy);
+
+  // 입자를 먼저 깔고 그 위에 링을 얹는다. 순서가 반대면 코어 글로우가 입자를 덮는다.
+  drawDust(R);
 
   // 바깥 회전 호
   ctx.strokeStyle = color;
@@ -173,6 +282,30 @@ function flashPresence(text) {
   presenceTimer = setTimeout(() => (presenceEl.textContent = previous), 1500);
 }
 
+// --- 브라우저 화면 ---
+//
+// 자비스가 웹을 뒤지는 동안 어느 페이지를 열었는지 구석에 띄운다. 서버가 2fps 로
+// jpeg 를 보내 준다 — 영상이 아니라서 이 정도면 충분하다.
+
+let browserBox = null;
+
+function showBrowser(frame, url) {
+  if (!frame) return;
+  if (!browserBox) {
+    browserBox = document.createElement("div");
+    browserBox.className = "browser-feed";
+    browserBox.innerHTML = '<img alt="" /><span></span>';
+    document.body.appendChild(browserBox);
+  }
+  browserBox.querySelector("img").src = "data:image/jpeg;base64," + frame;
+  browserBox.querySelector("span").textContent = url || "";
+}
+
+function hideBrowser() {
+  browserBox?.remove();
+  browserBox = null;
+}
+
 // --- WebSocket ---
 // 채팅 화면과 같은 토큰을 쓴다. 서버에 JAVIS_TOKEN 이 없으면 빈 값이어도 붙는다.
 let authToken = localStorage.getItem("javis_token") || "";
@@ -193,7 +326,15 @@ function connect() {
       // idle 로 튀면 안 되니, 상단에 따로 표시만 한다.
       if (m.state === "vision") return showPresence(m.faces || []);
       if (m.state === "gesture") return flashPresence(`✋ ${m.text || ""}`);
+      // 브라우저 화면은 리액터 상태와 무관하다. 여기서 끊지 않으면 setState 가
+      // 모르는 상태로 보고 idle 로 떨어뜨려, 말하다 말고 색이 튄다.
+      if (m.state === "browser") return showBrowser(m.frame, m.url);
+      if (m.state === "browser_off") return hideBrowser();
       if (m.state) setState(m.state, m.text);
+      // 목소리 세기가 같이 왔으면 입자를 거기에 맞춘다. 없으면 상태별 기본 움직임.
+      if (m.envelope) playEnvelope(m.envelope, m.frame_ms);
+      // 듣는 중에는 마이크 세기가 0.25초마다 온다.
+      if (m.level !== undefined) pushMicLevel(m.level, m.voice);
     } catch {}
   };
   ws.onclose = (ev) => {

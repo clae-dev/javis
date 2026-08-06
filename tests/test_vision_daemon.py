@@ -79,6 +79,17 @@ def test_cosine_of_normalized_vectors_is_the_dot_product(daemon):
     assert float(np.dot(a, b)) == pytest.approx(0.7071, abs=1e-3)
 
 
+def test_state_refresh_beats_the_server_ttl(daemon):
+    """데몬은 바뀐 게 없으면 안 보내고, 서버는 오래된 인식 결과를 버린다.
+
+    갱신 주기가 서버 TTL 보다 길면 가만히 앉아 있는 사람이 조용히 '없는 사람'이
+    된다 — 카메라에는 멀쩡히 보이는데 자비스는 아무도 없다고 답한다.
+    """
+    from app.api.vision import SIGHTING_TTL
+
+    assert daemon.STATE_REFRESH < SIGHTING_TTL
+
+
 def test_threshold_matches_the_server_dimension(daemon):
     """데몬이 만드는 임베딩 차원과 서버 컬럼 차원이 어긋나면 등록이 400 으로 막힌다."""
     from app.config import settings

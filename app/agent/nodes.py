@@ -83,16 +83,21 @@ async def prepare(state: JarvisState, config: RunnableConfig) -> dict:
     return {"user_profile": profile, "retrieved_context": context, "mood": mood}
 
 
-# 도구 바인딩은 11개 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번
-# 도는 걸 감안해 한 번만 묶어 재사용한다(온기를 살짝 주되 도구 신뢰성은 지키는 온도).
-_agent_llm = None
+# 도구 바인딩은 스키마를 매번 OpenAI 포맷으로 변환한다. ReAct 루프가 여러 번 도는 걸
+# 감안해 한 번만 묶어 재사용한다(온기를 살짝 주되 도구 신뢰성은 지키는 온도).
+_agent_llm: dict[bool, object] = {}
+
+# 사람 없이 도는 실행에서는 빼는 도구. 맡겨 둔 작업 안에서 또 작업을 맡기면 아무도
+# 일을 하지 않는다 — 실제로 첫 실행에서 이렇게 돌았다. 프롬프트로 타이르는 것보다
+# 목록에서 빼는 쪽이 확실하다.
+_HEADLESS_EXCLUDED = {"start_background_task"}
 
 
-def _get_agent_llm():
-    global _agent_llm
-    if _agent_llm is None:
-        _agent_llm = chat(streaming=True, temperature=0.5).bind_tools(TOOLS)
-    return _agent_llm
+def _get_agent_llm(headless: bool = False):
+    if headless not in _agent_llm:
+        tools = [t for t in TOOLS if t.name not in _HEADLESS_EXCLUDED] if headless else TOOLS
+        _agent_llm[headless] = chat(streaming=True, temperature=0.5).bind_tools(tools)
+    return _agent_llm[headless]
 
 
 # 반사 단계에서 기억과 감정을 추출할 때 쓸 LLM 바인딩. Pydantic 스키마 컴파일은 비싸므로
@@ -109,7 +114,9 @@ def _get_reflection_extractor():
 
 async def agent(state: JarvisState) -> dict:
     system = SystemMessage(content=build_system_prompt(state))
-    response = await _get_agent_llm().ainvoke([system, *state["messages"]])
+    response = await _get_agent_llm(bool(state.get("headless"))).ainvoke(
+        [system, *state["messages"]]
+    )
     return {"messages": [response]}
 
 
@@ -223,6 +230,30 @@ async def _reflect_worker(messages: list, old_summary: str | None, thread_id: st
         log.warning("반추 단계 실패(무시): %s", exc)
 
 
+# 이보다 짧은 한 마디로 끝난 턴은 새로 기억할 게 거의 없다. "응"·"고마워"·"알겠어"
+# 같은 맞장구까지 반추를 돌리면 턴마다 LLM 왕복이 붙는다 — 백그라운드라 응답은 안
+# 늦지만 비용과 API 부하는 그대로 쌓인다.
+_REFLECT_MIN_CHARS = 12
+
+
+def _worth_reflecting(messages: list) -> bool:
+    """이 턴에 새로 알게 된 게 있을 법한지 훑는다.
+
+    도구를 썼다면 실제로 뭔가 한 턴이니 무조건 본다. 그게 아니면 사용자 발화가
+    맞장구 수준을 넘을 때만 본다. 건너뛴 턴은 감정도 갱신되지 않지만, 맞장구
+    한 마디로 기분이 바뀌었다고 볼 이유도 없어 직전 값을 그대로 쓴다.
+    """
+    turn = messages
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            turn = messages[i:]
+            break
+
+    if any(getattr(m, "tool_calls", None) for m in turn):
+        return True
+    return len(_last_human_text(turn).strip()) >= _REFLECT_MIN_CHARS
+
+
 async def reflect(state: JarvisState, config: RunnableConfig) -> dict:
     """기억 저장과 감정 읽기를 백그라운드로 떼어내 응답 지연을 없앤다.
 
@@ -230,6 +261,8 @@ async def reflect(state: JarvisState, config: RunnableConfig) -> dict:
     종료한다. 여기서 읽은 감정은 다음 턴 응답에 반영된다(한 턴 지연).
     """
     recent = list(state["messages"][-6:])
+    if not _worth_reflecting(recent):
+        return {}
     # prepare 가 이미 끌어온 프로필 요약을 넘겨, 프로필 갱신 때 같은 행을 다시 읽지 않게 한다.
     summary = (state.get("user_profile") or {}).get("summary")
     _spawn(_reflect_worker(recent, summary, _thread_id(config)))

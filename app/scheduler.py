@@ -22,6 +22,7 @@ from app.api.notifications import manager
 from app.config import settings
 from app.db.models import Reminder, ScheduledJob
 from app.db.session import async_session
+from app.headless import run_prompt
 
 log = logging.getLogger("javis.scheduler")
 _scheduler: AsyncIOScheduler | None = None
@@ -76,61 +77,18 @@ async def _index_notes() -> None:
 # --- 사용자 정기 작업 ---
 
 
-def _answer_of(state: dict) -> str:
-    """그래프 최종 상태에서 마지막 답변 텍스트만 뽑는다."""
-    from langchain_core.messages import AIMessage
-
-    for message in reversed(state.get("messages") or []):
-        if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content.strip():
-            return message.content.strip()
-    return ""
-
-
 async def _run_job(job_id: int) -> None:
-    from langchain_core.messages import HumanMessage
-    from langgraph.types import Command
-
-    from app.agent.runtime import runtime
-
     async with async_session() as session:
         job = await session.get(ScheduledJob, job_id)
         if job is None or not job.enabled:
             return
         name, prompt = job.name, job.prompt
 
-    if runtime.graph is None:
-        log.warning("예약 작업 '%s' 건너뜀 — 그래프가 아직 준비되지 않았습니다.", name)
-        return
+    # 승인해 줄 사람이 없는 시간대에 도는 만큼, 쓰기 도구 확인이 걸리면 실행하지 않고
+    # 취소로 정리한 뒤 알리기만 한다. 그 처리는 headless 가 맡는다.
+    result = await run_prompt(prompt, thread_prefix=f"schedule-{name}", timeout=JOB_TIMEOUT)
 
-    # 실행마다 대화 맥락을 새로 시작한다. 예약 작업은 이어 말하기가 아니라 매번 독립이고,
-    # 앞선 실행에 확인 대기가 남아 있어도 다음 실행이 거기 물리지 않는다.
-    thread = f"schedule-{name}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
-    config = {"configurable": {"thread_id": thread}}
-    payload = {
-        "messages": [HumanMessage(content=prompt)],
-        "user_profile": {"name": settings.owner_name},
-    }
-
-    notice = ""
-    try:
-        state = await asyncio.wait_for(
-            runtime.graph.ainvoke(payload, config=config), timeout=JOB_TIMEOUT
-        )
-        if "__interrupt__" in state:
-            blocked = state["__interrupt__"][0].value or {}
-            names = ", ".join(a.get("name", "?") for a in blocked.get("actions", []))
-            notice = f"\n\n(확인이 필요한 작업이라 실행하지 않았습니다: {names})"
-            state = await asyncio.wait_for(
-                runtime.graph.ainvoke(Command(resume=False), config=config), timeout=JOB_TIMEOUT
-            )
-        answer = _answer_of(state) or "(답변이 비었습니다)"
-    except asyncio.TimeoutError:
-        answer = "작업이 제한 시간 안에 끝나지 않았습니다."
-    except Exception as exc:
-        log.exception("예약 작업 실패: %s", name)
-        answer = f"작업 중 오류가 났습니다: {exc}"
-
-    await manager.broadcast({"type": "proactive", "content": f"🗓 {name}\n{answer}{notice}"})
+    await manager.broadcast({"type": "proactive", "content": f"🗓 {name}\n{result.text}"})
 
     async with async_session() as session:
         job = await session.get(ScheduledJob, job_id)

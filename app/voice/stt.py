@@ -26,7 +26,7 @@ def _transcribe_local(audio: bytes, language: str) -> str:
     segments, _ = _load_local().transcribe(
         io.BytesIO(audio),
         language=language,
-        beam_size=5,
+        beam_size=settings.stt_local_beam,
         vad_filter=False,
     )
     return "".join(seg.text for seg in segments).strip()

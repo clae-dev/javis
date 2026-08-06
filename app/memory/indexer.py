@@ -7,6 +7,9 @@ pgvector 에 넣는다. 장기 기억(long_term)이 '대화에서 추려낸 문�
 증분으로 돈다. mtime 이 그대로면 파일을 열지도 않고, mtime 만 바뀌고 내용이 같으면
 (편집기가 저장만 다시 한 경우) 임베딩을 다시 만들지 않는다. 노트 폴더가 커질수록
 이 두 단계가 비용의 대부분을 걷어낸다.
+
+무엇이 바뀌었는지 판단할 재료(경로별 mtime·sha)는 한 바퀴 시작할 때 통째로 받아 둔다.
+파일마다 조회하면 바뀐 게 하나도 없어도 파일 수만큼 DB 왕복이 나간다.
 """
 
 import asyncio
@@ -16,7 +19,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.config import settings
 from app.db.models import Document, DocumentChunk
@@ -32,6 +35,10 @@ SETUP_HINT = (
 
 # 임베딩 한 번에 보낼 조각 수. 너무 크면 한 요청이 실패했을 때 잃는 게 많다.
 _EMBED_BATCH = 64
+
+# 동시에 색인할 파일 수. 파일 하나의 시간은 대부분 임베딩 API 를 기다리는 데 쓰이므로
+# 몇 개를 겹쳐 돌리면 첫 전체 색인이 그만큼 짧아진다. 너무 올리면 rate limit 에 걸린다.
+_INDEX_CONCURRENCY = 4
 
 # 옵시디언 내부 폴더와 흔한 잡동사니. 색인해 봐야 검색만 더러워진다.
 _SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "__pycache__", ".venv", "venv"}
@@ -187,8 +194,36 @@ def _embed_text(title: str, chunk: Chunk) -> str:
 # --- 색인 ---
 
 
-async def _index_file(path: Path, root: Path) -> int:
-    """파일 하나를 색인한다. 새로 만든 조각 수를 돌려준다(변경 없으면 0)."""
+async def _load_state() -> dict[str, tuple[float, str]]:
+    """색인해 둔 노트의 {상대경로: (mtime, sha)} 를 한 번에 받는다.
+
+    파일마다 조회하면 바뀐 게 없는 폴더에서도 파일 수만큼 왕복이 나간다. 판단에 쓰는
+    건 두 컬럼뿐이라 행 전체(=조각 수천 개의 부모)를 끌어올 이유도 없다.
+    """
+    async with async_session() as session:
+        rows = await session.execute(select(Document.path, Document.mtime, Document.sha))
+        return {path: (mtime, sha) for path, mtime, sha in rows}
+
+
+async def _state_of(rel: str) -> dict[str, tuple[float, str]]:
+    """파일 하나짜리 상태. 폴더를 다 훑지 않고 한 건만 색인할 때 쓴다."""
+    async with async_session() as session:
+        row = (
+            await session.execute(
+                select(Document.mtime, Document.sha).where(Document.path == rel)
+            )
+        ).first()
+    return {rel: (row[0], row[1])} if row is not None else {}
+
+
+async def _index_file(
+    path: Path, root: Path, known: dict[str, tuple[float, str]] | None = None
+) -> int:
+    """파일 하나를 색인한다. 새로 만든 조각 수를 돌려준다(변경 없으면 0).
+
+    known 은 미리 받아 둔 {상대경로: (mtime, sha)}. 가장 흔한 경우(아무것도 안 바뀜)를
+    DB 를 보지 않고 걸러내려고 호출부에서 통째로 넘겨받는다.
+    """
     rel = path.relative_to(root).as_posix()
     try:
         mtime = path.stat().st_mtime
@@ -196,91 +231,109 @@ async def _index_file(path: Path, root: Path) -> int:
         log.warning("파일 정보를 읽지 못했습니다(%s): %s", rel, exc)
         return 0
 
-    async with async_session() as session:
-        row = (
-            await session.execute(select(Document).where(Document.path == rel))
-        ).scalar_one_or_none()
-        # 가장 흔한 경우: 아무것도 안 바뀌었다. 파일을 열지도 않는다.
-        if row is not None and row.mtime == mtime:
-            return 0
+    if known is None:
+        known = await _state_of(rel)
+    prev = known.get(rel)
 
-    text = await asyncio.to_thread(_read_text, path)
+    # 가장 흔한 경우: 아무것도 안 바뀌었다. 파일도 DB 도 열지 않는다.
+    if prev is not None and prev[0] == mtime:
+        return 0
+
+    text = await asyncio.to_thread(read_text, path)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    async with async_session() as session:
-        row = (
-            await session.execute(select(Document).where(Document.path == rel))
-        ).scalar_one_or_none()
-
-        # 저장만 다시 눌러 mtime 이 밀린 경우. 내용이 같으니 임베딩은 그대로 둔다.
-        if row is not None and row.sha == sha:
-            row.mtime = mtime
+    # 저장만 다시 눌러 mtime 이 밀린 경우. 내용이 같으니 임베딩은 그대로 두고 시각만 민다.
+    if prev is not None and prev[1] == sha:
+        async with async_session() as session:
+            await session.execute(
+                update(Document).where(Document.path == rel).values(mtime=mtime)
+            )
             await session.commit()
-            return 0
+        known[rel] = (mtime, sha)
+        return 0
 
-        chunks = chunk_markdown(text)
-        title = path.stem
+    title = path.stem
+    chunks = chunk_markdown(text)
 
-        if not chunks:
-            # 빈 파일도 기록은 남긴다. 안 그러면 매 주기마다 다시 읽는다.
-            if row is None:
-                session.add(Document(path=rel, title=title, sha=sha, mtime=mtime, chunks=0))
-            else:
-                row.title, row.sha, row.mtime, row.chunks = title, sha, mtime, 0
-                await session.execute(
-                    delete(DocumentChunk).where(DocumentChunk.document_id == row.id)
-                )
-            await session.commit()
-            return 0
-
+    # 임베딩은 세션 밖에서 만든다 — 수십 초짜리 API 왕복 동안 커넥션을 붙들고 있을 이유가 없다.
     vectors: list[list[float]] = []
-    payloads = [_embed_text(path.stem, c) for c in chunks]
-    for i in range(0, len(payloads), _EMBED_BATCH):
-        vectors.extend(await embeddings().aembed_documents(payloads[i : i + _EMBED_BATCH]))
+    if chunks:
+        payloads = [_embed_text(title, c) for c in chunks]
+        for i in range(0, len(payloads), _EMBED_BATCH):
+            vectors.extend(await embeddings().aembed_documents(payloads[i : i + _EMBED_BATCH]))
 
     async with async_session() as session:
         row = (
             await session.execute(select(Document).where(Document.path == rel))
         ).scalar_one_or_none()
         if row is None:
-            row = Document(path=rel, title=path.stem, sha=sha, mtime=mtime, chunks=len(chunks))
+            # 빈 파일도 기록은 남긴다. 안 그러면 매 주기마다 다시 읽는다.
+            row = Document(path=rel, title=title, sha=sha, mtime=mtime, chunks=len(chunks))
             session.add(row)
             await session.flush()
         else:
-            row.title, row.sha, row.mtime, row.chunks = path.stem, sha, mtime, len(chunks)
+            row.title, row.sha, row.mtime, row.chunks = title, sha, mtime, len(chunks)
             # 조각은 통째로 갈아 끼운다. 부분 갱신은 순서가 꼬이기 쉽고 이득이 적다.
             await session.execute(
                 delete(DocumentChunk).where(DocumentChunk.document_id == row.id)
             )
 
-        session.add_all(
-            [
-                DocumentChunk(
-                    document_id=row.id,
-                    ordinal=i,
-                    heading=chunk.heading[:512],
-                    content=chunk.content,
-                    embedding=vec,
-                )
-                for i, (chunk, vec) in enumerate(zip(chunks, vectors))
-            ]
-        )
+        if chunks:
+            session.add_all(
+                [
+                    DocumentChunk(
+                        document_id=row.id,
+                        ordinal=i,
+                        heading=chunk.heading[:512],
+                        content=chunk.content,
+                        embedding=vec,
+                    )
+                    for i, (chunk, vec) in enumerate(zip(chunks, vectors))
+                ]
+            )
         await session.commit()
 
+    known[rel] = (mtime, sha)
     return len(chunks)
 
 
-async def _drop_missing(seen: set[str]) -> int:
-    """폴더에서 사라진 노트를 색인에서도 지운다."""
+async def _drop_missing(seen: set[str], known: dict[str, tuple[float, str]]) -> int:
+    """폴더에서 사라진 노트를 색인에서도 지운다.
+
+    지울 게 있는지는 이미 받아 둔 상태로 판단한다. 대개는 하나도 없어서 쿼리가 안 나간다.
+    """
+    gone = [rel for rel in known if rel not in seen]
+    if not gone:
+        return 0
+
     async with async_session() as session:
-        rows = (await session.execute(select(Document))).scalars().all()
-        gone = [d for d in rows if d.path not in seen]
-        for doc in gone:
-            await session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
-            await session.delete(doc)
-        if gone:
+        rows = (
+            await session.execute(select(Document).where(Document.path.in_(gone)))
+        ).scalars().all()
+        if rows:
+            await session.execute(
+                delete(DocumentChunk).where(
+                    DocumentChunk.document_id.in_([d.id for d in rows])
+                )
+            )
+            for doc in rows:
+                await session.delete(doc)
             await session.commit()
-    return len(gone)
+    return len(rows)
+
+
+async def _index_guarded(
+    path: Path, root: Path, known: dict[str, tuple[float, str]], sem: asyncio.Semaphore
+) -> int | None:
+    """세마포어 아래에서 파일 하나를 색인한다. 실패하면 None."""
+    async with sem:
+        try:
+            return await _index_file(path, root, known)
+        except Exception as exc:
+            # 파일 하나가 깨져도 나머지는 색인한다. 다만 조용히 넘기지는 않는다 —
+            # 전부 실패해도 "바뀐 내용 없음"으로 보이면 고장을 눈치챌 수가 없다.
+            log.warning("노트 색인 실패(%s): %s", path.name, exc)
+            return None
 
 
 async def reindex() -> str:
@@ -294,26 +347,25 @@ async def reindex() -> str:
 
     async with _lock:
         files = await asyncio.to_thread(_walk, root)
-        indexed = 0
-        chunks = 0
-        for path in files:
-            try:
-                made = await _index_file(path, root)
-            except Exception as exc:
-                log.warning("노트 색인 실패(%s): %s", path.name, exc)
-                continue
-            if made:
-                indexed += 1
-                chunks += made
+        known = await _load_state()
 
-        removed = await _drop_missing({p.relative_to(root).as_posix() for p in files})
+        sem = asyncio.Semaphore(_INDEX_CONCURRENCY)
+        made = await asyncio.gather(*(_index_guarded(p, root, known, sem) for p in files))
+
+        failed = sum(1 for m in made if m is None)
+        indexed = sum(1 for m in made if m)
+        chunks = sum(m for m in made if m)
+
+        removed = await _drop_missing({p.relative_to(root).as_posix() for p in files}, known)
 
     parts = [f"노트 {len(files)}개 확인"]
     if indexed:
         parts.append(f"{indexed}개 새로 색인({chunks}조각)")
     if removed:
         parts.append(f"{removed}개 삭제 반영")
-    if not indexed and not removed:
+    if failed:
+        parts.append(f"{failed}개 실패(로그 확인)")
+    if not indexed and not removed and not failed:
         parts.append("바뀐 내용 없음")
     return ", ".join(parts)
 

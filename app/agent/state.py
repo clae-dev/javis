@@ -19,3 +19,7 @@ class JarvisState(TypedDict):
 
     # 대화 환경. "drive" 면 운전 중이라 화면을 못 보므로 답을 짧게 줄인다.
     mode: Optional[str]
+
+    # 사람 없이 도는 실행(정기 작업·맡겨 둔 작업)인지. 이 턴에서는 일을 남에게
+    # 다시 미룰 수 없게 도구 목록이 좁아진다.
+    headless: Optional[bool]

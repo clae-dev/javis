@@ -73,21 +73,5 @@ class _Row:
         self.__dict__.update(kw)
 
 
-# --- 예약 실행의 안전장치 ---
-
-
-def test_answer_of_picks_last_ai_message():
-    from langchain_core.messages import AIMessage, HumanMessage
-
-    state = {
-        "messages": [
-            HumanMessage(content="확인해줘"),
-            AIMessage(content="", tool_calls=[]),
-            AIMessage(content="새 매물 3건 있습니다."),
-        ]
-    }
-    assert scheduler._answer_of(state) == "새 매물 3건 있습니다."
-
-
-def test_answer_of_handles_empty_state():
-    assert scheduler._answer_of({}) == ""
+# 예약 실행이 그래프를 태우는 부분은 백그라운드 작업과 같은 코드를 쓴다.
+# 그쪽 검증은 tests/test_headless.py 에 있다.

@@ -122,6 +122,29 @@ class ScheduledJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class BackgroundTask(Base):
+    """시켜 놓고 자리를 뜬 작업.
+
+    "카이트 타고 올 동안 아마존 인기 상품 좀 모아 둬" 같은 것. 정기 작업(ScheduledJob)이
+    '정해진 시각에 반복'이라면 이쪽은 '지금 시작해서 언젠가 끝나는' 한 번짜리다.
+    끝나면 능동 알림으로 결과를 밀어 준다.
+
+    상태는 running → done/failed 로 간다. 프로세스가 죽으면 진행 중이던 건 살릴 수
+    없으므로, 기동할 때 남아 있는 running 을 interrupted 로 정리한다 — 안 그러면
+    영원히 '진행 중'으로 남아 사용자가 계속 기다리게 된다.
+    """
+
+    __tablename__ = "background_tasks"
+    __table_args__ = (Index("ix_background_tasks_status", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    result: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AuditLog(Base):
     """LLM 호출·도구 실행 기록. 자비스가 이상하게 굴 때 추적할 유일한 단서."""
 

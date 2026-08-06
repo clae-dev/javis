@@ -119,6 +119,32 @@ def test_valid_frame_decodes():
     assert vision._resolve_frame(payload) == b"\xff\xd8jpeg"
 
 
+# --- 등록된 얼굴 직렬화 ---
+
+
+async def test_enrolling_tells_the_daemon_to_reload():
+    """알림이 없으면 얼굴을 등록해 놓고도 데몬을 다시 띄울 때까지 못 알아본다."""
+    vision._client = FakeSocket()
+    await vision._notify_faces_changed()
+    assert vision._client.sent == [{"type": "faces_updated"}]
+
+
+async def test_notify_without_daemon_is_quiet():
+    await vision._notify_faces_changed()  # 카메라가 안 붙어 있어도 등록은 되어야 한다
+
+
+def test_embeddings_serialize_as_plain_floats():
+    """pgvector 는 numpy 배열을 돌려준다. numpy.float32 는 JSON 으로 못 나가고,
+    그대로 두면 목록 조회가 500 으로 죽는다 — 데몬이 얼굴을 하나도 못 받는다."""
+    import json
+
+    np = pytest.importorskip("numpy")
+    values = vision._floats(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    assert all(type(v) is float for v in values)
+    json.dumps(values)  # 여기서 터지면 엔드포인트도 터진다
+
+
 # --- 누가 보이는지 ---
 
 

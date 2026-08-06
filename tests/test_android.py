@@ -180,3 +180,51 @@ async def test_setup_hint_without_adb(monkeypatch):
     monkeypatch.setattr(android.shutil, "which", lambda _: None)
     out, err = await android._adb(["devices"])
     assert err == android.SETUP_HINT
+
+
+# --- 전화 ---
+#
+# 문자와 달리 전화는 잘못 걸면 되돌릴 수 없다. 기본이 '띄우기만' 인지 못박아 둔다.
+
+
+async def test_call_only_dials_up_by_default(shell, monkeypatch):
+    calls, _ = shell
+    monkeypatch.setattr(android.settings, "android_call_autodial", False)
+
+    result = await android.place_call.ainvoke({"to": "010-1234-5678"})
+    assert len(calls) == 1
+    assert "action.DIAL" in calls[0]
+    assert "action.CALL" not in calls[0]
+    assert "tel:01012345678" in calls[0]
+    assert "눌러 주세요" in result
+
+
+async def test_call_dials_immediately_when_enabled(shell, monkeypatch):
+    """운전 중처럼 화면을 못 볼 때만 켜는 설정."""
+    calls, _ = shell
+    monkeypatch.setattr(android.settings, "android_call_autodial", True)
+
+    result = await android.place_call.ainvoke({"to": "01011112222"})
+    assert "action.CALL" in calls[0]
+    assert "걸었습니다" in result
+
+
+@pytest.mark.parametrize("raw", ["010-1234-5678", "010 1234 5678", "(010)1234-5678"])
+async def test_call_number_is_normalized(shell, raw):
+    """음성 인식이 번호를 어떻게 받아 적든 같은 곳으로 걸려야 한다."""
+    calls, _ = shell
+    await android.place_call.ainvoke({"to": raw})
+    assert "tel:01012345678" in calls[0]
+
+
+async def test_international_prefix_survives(shell):
+    calls, _ = shell
+    await android.place_call.ainvoke({"to": "+82-10-1234-5678"})
+    assert "tel:+821012345678" in calls[0]
+
+
+async def test_call_without_a_number_does_nothing(shell):
+    calls, _ = shell
+    result = await android.place_call.ainvoke({"to": "그 사람"})
+    assert calls == []  # 아무 데도 걸면 안 된다
+    assert "알아보지 못했습니다" in result

@@ -55,7 +55,12 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 BACKEND = os.environ.get("JAVIS_BACKEND", "http://localhost:8000")
-WS_URL = BACKEND.replace("https", "wss").replace("http", "ws") + "/ws/chat?thread_id=voice"
+_WS_BASE = BACKEND.replace("https", "wss").replace("http", "ws")
+WS_URL = _WS_BASE + "/ws/chat?thread_id=voice"
+# 능동 알림만 듣는 별도 연결. 대화 소켓은 턴 사이에 아무도 읽지 않아서 알림이 갇힌다.
+WS_URL_NOTIFY = _WS_BASE + "/ws/chat?thread_id=voice-notify"
+NOTIFY_TIMEOUT = 60          # recv 타임아웃(초). 지나면 연결 확인만 하고 다시 듣는다.
+NOTIFY_WAIT_MAX = 120        # 대화가 끝나기를 이만큼(초) 기다렸다가 포기한다.
 
 # 백엔드에 JAVIS_TOKEN 이 설정돼 있으면 같은 값을 여기도 넣는다. 비어 있으면 인증 없음.
 TOKEN = os.environ.get("JAVIS_TOKEN", "").strip()
@@ -100,12 +105,21 @@ OWW_THRESHOLD = float(os.environ.get("JAVIS_OWW_THRESHOLD", "0.5"))  # 0~1, 높�
 # 답변이 끝난 뒤 이만큼(초)은 깨우지 않고 바로 이어 말할 수 있다. 0 이면 매번 다시 불러야 한다.
 CONV_TIMEOUT = float(os.environ.get("JAVIS_CONV_TIMEOUT", "10"))
 
-# 첫 덩어리는 로컬 음성(Windows SAPI)으로 즉시 내보낸다. 클라우드 왕복이 빠지는 만큼
-# 첫 소리가 빨라진다. 대신 첫 문장만 목소리가 다르다 — 거슬리면 0 으로 끈다.
-TTS_FIRST_LOCAL = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "1") != "0"
-
 # 운전 모드. 백엔드가 답변을 두세 문장으로 줄인다.
 DRIVE_MODE = os.environ.get("JAVIS_DRIVE", "0") != "0"
+
+# 첫 덩어리를 로컬 음성(Windows SAPI)으로 즉시 내보낼지. 클라우드 왕복이 빠져 첫 소리가
+# 빨라지지만, 첫 문장만 목소리가 달라진다. 목소리로 인격을 만드는 이상 이 불일치는
+# 책상 앞에서 제일 거슬리는 지점이다 — 반대로 차 안에서는 지연이 크고 노면 소음이
+# 차이를 덮어서 이득만 남는다. 그래서 기본은 auto (운전 모드에서만 켬).
+#   auto(기본) / 1(항상) / 0(끔)
+_first_local = os.environ.get("JAVIS_TTS_FIRST_LOCAL", "auto").strip().lower()
+TTS_FIRST_LOCAL = DRIVE_MODE if _first_local == "auto" else _first_local != "0"
+
+# 백엔드 웹소켓은 한 번 붙여 두고 계속 쓴다. 다만 이만큼(초) 놀린 연결은 NAT·방화벽이
+# 조용히 끊어 놓았을 수 있어, 쓰기 전에 새로 붙는다. 죽은 소켓에 보내면 살아 있는 줄
+# 알고 응답을 기다리다 타임아웃까지 통째로 날린다.
+WS_IDLE_MAX = float(os.environ.get("JAVIS_WS_IDLE_MAX", "120"))
 
 
 def _resolve_device(hint: str, kind: str):
@@ -139,6 +153,98 @@ def ensure_model() -> str:
     zip_path.unlink()
     print("모델 준비 완료.")
     return str(MODEL_PATH)
+
+
+# --- 발화 종료 감지 (Silero VAD) ---
+#
+# 종료 판정을 인식기에 맡기면(Vosk 부분 결과가 안 자라면 끝난 걸로) 인식이 흔들릴 때
+# 같이 흔들린다. 조용히 말하거나 시끄러운 데서 말이 끊기거나 안 끊긴다. 소리에 사람
+# 목소리가 있는지만 보는 전용 모델을 쓰면 인식 성능과 분리된다.
+#
+# 파이썬 패키지(silero-vad)는 torch 를 끌어온다(윈도우 CPU 빌드 ~2GB). ONNX 모델
+# 하나(2.3MB)를 onnxruntime 으로 직접 돌리면 그럴 필요가 없다 — onnxruntime 은
+# openWakeWord 가 이미 가져다 놨다.
+VAD_MODEL_URL = (
+    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+)
+VAD_MODEL_PATH = MODEL_DIR / "silero_vad.onnx"
+
+VAD_ENABLE = os.environ.get("JAVIS_VAD", "1") != "0"
+# 이 확률 이상이면 사람이 말하는 중으로 본다.
+VAD_THRESHOLD = float(os.environ.get("JAVIS_VAD_THRESHOLD", "0.5"))
+
+_VAD_CHUNK = 512      # v5 는 16kHz 에서 이 크기로만 판정한다
+_VAD_CONTEXT = 64     # 직전 청크 꼬리를 앞에 붙여 넣어야 한다(576 샘플). 없으면 전부 0 이 나온다.
+
+
+def ensure_vad_model() -> Path | None:
+    """VAD 모델을 준비한다. 못 받으면 None (Vosk 방식으로 폴백)."""
+    if VAD_MODEL_PATH.exists() and VAD_MODEL_PATH.stat().st_size > 100_000:
+        return VAD_MODEL_PATH
+    try:
+        print("음성 감지 모델 다운로드 중 (~2MB, 최초 1회)…", flush=True)
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = VAD_MODEL_PATH.with_suffix(".part")
+        with requests.get(VAD_MODEL_URL, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    f.write(chunk)
+        tmp.replace(VAD_MODEL_PATH)
+        return VAD_MODEL_PATH
+    except Exception as exc:
+        print("음성 감지 모델을 받지 못했습니다(Vosk 방식으로 진행):", exc, flush=True)
+        return None
+
+
+class VoiceDetector:
+    """오디오 조각을 먹여 '지금 사람이 말하고 있는지' 확률을 받는다."""
+
+    def __init__(self, session) -> None:
+        self._sess = session
+        self._sr = np.array(SAMPLE_RATE, dtype=np.int64)
+        self.reset()
+
+    @staticmethod
+    def create() -> "VoiceDetector | None":
+        """쓸 수 있으면 만들고, 아니면 None. 여기서 실패해도 데몬은 그대로 돈다."""
+        if not VAD_ENABLE:
+            return None
+        path = ensure_vad_model()
+        if path is None:
+            return None
+        try:
+            import onnxruntime as ort
+
+            sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            return VoiceDetector(sess)
+        except Exception as exc:
+            print("음성 감지 초기화 실패(Vosk 방식으로 진행):", exc, flush=True)
+            return None
+
+    def reset(self) -> None:
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(_VAD_CONTEXT, dtype=np.float32)
+        self._left = np.empty(0, dtype=np.float32)
+
+    def feed(self, pcm: bytes) -> float:
+        """이 조각에서 나온 확률 중 가장 높은 값. 조각이 짧으면 직전 값을 이어 쓴다."""
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        self._left = np.concatenate([self._left, samples])
+
+        best = 0.0
+        while len(self._left) >= _VAD_CHUNK:
+            chunk, self._left = self._left[:_VAD_CHUNK], self._left[_VAD_CHUNK:]
+            frame = np.concatenate([self._context, chunk]).reshape(1, -1)
+            try:
+                out, self._state = self._sess.run(
+                    None, {"input": frame, "state": self._state, "sr": self._sr}
+                )
+            except Exception:
+                return best
+            self._context = chunk[-_VAD_CONTEXT:]
+            best = max(best, float(out[0][0]))
+        return best
 
 
 def _norm(text: str) -> str:
@@ -185,50 +291,185 @@ def _first_cut(buf: str) -> int:
 _KOREAN_VOICE_HINTS = ("korean", "한국")
 
 
-def _tts_local(text: str):
-    """Windows SAPI 로 즉시 합성해 (오디오, 샘플레이트) 를 준다. 실패하면 None.
+class _LocalTTS:
+    """Windows SAPI 합성기를 전용 스레드 하나에 가둬 두고 재사용한다.
 
-    클라우드 왕복(수백 ms)이 통째로 빠지므로 답변 첫 덩어리만 여기로 보내 첫 소리를
-    앞당긴다. 목소리 품질은 클라우드가 낫기 때문에 나머지 문장은 그쪽으로 간다.
+    합성 자체는 빠른데 준비가 비쌌다. 발화마다 CoInitialize → SAPI.SpVoice 생성 →
+    설치된 음성 전체 열거를 다시 하면 수백 ms 가 붙는다 — 하필 '첫 소리를 앞당기려고'
+    로컬 합성을 쓰는 구간이라 벌어 온 시간을 그대로 까먹는다.
+
+    COM 객체는 만든 스레드에서만 안전하게 쓸 수 있어서, 스레드를 하나 띄워 거기서
+    딱 한 번 준비하고 이후에는 텍스트만 넘긴다. 요청 큐로 받고 결과는 일회용 큐로
+    돌려준다.
     """
-    if os.name != "nt":
-        return None
 
-    tmp = None
-    try:
-        import pythoncom
+    def __init__(self) -> None:
+        self._jobs: "queue.Queue[tuple[str, queue.Queue]]" = queue.Queue()
+        self._ready = threading.Event()
+        self._voice = None
+        self._ok = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def warm(self, timeout: float = 10.0) -> bool:
+        """준비가 끝날 때까지 기다린다. 이 기계에서 못 쓰면 False."""
+        self._ready.wait(timeout)
+        return self._ok
+
+    def synth(self, text: str, timeout: float = 10.0):
+        """(오디오, 샘플레이트) 또는 실패 시 None. 호출부는 None 이면 클라우드로 간다."""
+        if not self._ok:
+            return None
+        box: "queue.Queue" = queue.Queue(maxsize=1)
+        self._jobs.put((text, box))
+        try:
+            return box.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _loop(self) -> None:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            self._voice = win32com.client.Dispatch("SAPI.SpVoice")
+            # 기본 음성이 영어면 한국어를 이상하게 읽는다. 한국어 음성이 있으면 그걸 쓴다.
+            for token in self._voice.GetVoices():
+                if any(h in token.GetDescription().lower() for h in _KOREAN_VOICE_HINTS):
+                    self._voice.Voice = token
+                    break
+            self._ok = True
+        except Exception as exc:
+            if DEBUG:
+                print("  (로컬 합성 사용 불가 → 클라우드)", exc, flush=True)
+        finally:
+            self._ready.set()
+
+        if not self._ok:
+            return
+
+        while True:
+            text, box = self._jobs.get()
+            box.put(self._speak(text))
+
+    def _speak(self, text: str):
+        # 메모리 스트림 대신 임시 파일을 거친다. SAPI 메모리 스트림은 헤더 없는 PCM 이
+        # 나와 포맷을 손으로 맞춰야 하는데, 짧은 문장 파일 하나 쓰고 읽는 비용은 어차피
+        # 위에서 걷어낸 COM 준비 비용에 비하면 없는 것과 같다.
         import win32com.client
 
-        pythoncom.CoInitialize()
+        tmp = None
         try:
-            voice = win32com.client.Dispatch("SAPI.SpVoice")
-            # 기본 음성이 영어면 한국어를 이상하게 읽는다. 한국어 음성이 있으면 그걸 쓴다.
-            for token in voice.GetVoices():
-                if any(h in token.GetDescription().lower() for h in _KOREAN_VOICE_HINTS):
-                    voice.Voice = token
-                    break
-
             fd, tmp = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
             stream = win32com.client.Dispatch("SAPI.SpFileStream")
             stream.Open(tmp, 3)  # 3 = 쓰기용으로 새로 만들기
-            voice.AudioOutputStream = stream
-            voice.Speak(text)
+            self._voice.AudioOutputStream = stream
+            self._voice.Speak(text)
             stream.Close()
-
             return sf.read(tmp, dtype="float32")
+        except Exception as exc:
+            if DEBUG:
+                print("  (로컬 합성 실패 → 클라우드)", exc, flush=True)
+            return None
         finally:
-            pythoncom.CoUninitialize()
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
+_local_tts: "_LocalTTS | None" = None
+
+
+def _start_local_tts() -> None:
+    """로컬 합성기를 미리 띄운다. 첫 발화가 COM 초기화를 기다리지 않게 한다."""
+    global _local_tts
+    if os.name != "nt" or not TTS_FIRST_LOCAL or _local_tts is not None:
+        return
+    _local_tts = _LocalTTS()
+    if _local_tts.warm():
+        # 객체를 만드는 것과 별개로, 첫 Speak 에도 한 번뿐인 준비 비용이 붙는다
+        # (실측 200ms 남짓). 짧은 문장 하나를 버리는 셈 치고 합성해 그것까지 여기서
+        # 치른다. 재생은 하지 않으니 아무 소리도 나지 않는다.
+        _local_tts.synth("네")
+
+
+def _tts_local(text: str):
+    """Windows SAPI 로 즉시 합성해 (오디오, 샘플레이트) 를 준다. 못 쓰면 None.
+
+    클라우드 왕복(수백 ms)이 통째로 빠지므로 답변 첫 덩어리만 여기로 보내 첫 소리를
+    앞당긴다. 목소리 품질은 클라우드가 낫기 때문에 나머지 문장은 그쪽으로 간다.
+    """
+    _start_local_tts()  # 미리 안 띄웠으면 여기서 한 번(이후 호출은 그냥 통과)
+    return _local_tts.synth(text) if _local_tts is not None else None
+
+
+# HUD 입자가 목소리에 맞춰 움직이려면 소리의 세기를 알아야 한다. 오디오 자체를
+# 브라우저로 넘기는 방법도 있지만(원본이 그렇게 한다), 그러면 재생 주체가 화면이 되어
+# 운전 중이나 화면 없이 쓸 때가 깨진다. 대신 여기서 세기만 뽑아 숫자로 넘긴다.
+ENVELOPE_FRAME_MS = 33          # ~30fps. 눈으로는 이보다 촘촘해도 차이를 못 느낀다.
+_ENVELOPE_MAX_FRAMES = 900      # 30초어치. 그보다 긴 클립은 뒤를 자른다(전송량 상한).
+# 이 진폭을 '가득 찬 소리'로 본다. 클립마다 최대값으로 정규화하면 조용한 한마디가
+# 고함처럼 보인다 — 고정 기준을 써야 크게 말할 때 실제로 커진다.
+_ENVELOPE_REF = 0.28
+_BANDS = ((0, 300), (300, 2000), (2000, 8000))   # 저 / 중 / 고역 (Hz)
+
+
+def _block_level(pcm: bytes) -> float:
+    """오디오 블록 하나의 세기(0~1). 듣는 동안 화면에 흘려보내는 값."""
+    try:
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if not samples.size:
+            return 0.0
+        return float(np.clip(np.sqrt(np.mean(samples * samples)) / _ENVELOPE_REF, 0, 1))
+    except Exception:
+        return 0.0
+
+
+def _envelope(audio, sr: int) -> list[list[float]]:
+    """오디오를 프레임별 [전체세기, 저역, 중역, 고역] 목록으로 요약한다. 0~1 범위."""
+    try:
+        data = np.asarray(audio, dtype=np.float32)
+        if data.ndim > 1:            # 스테레오면 모노로 접는다
+            data = data.mean(axis=1)
+        step = max(1, int(sr * ENVELOPE_FRAME_MS / 1000))
+        frames = min(len(data) // step, _ENVELOPE_MAX_FRAMES)
+        if frames <= 0:
+            return []
+
+        # (frames, step) 으로 잘라 한 번에 계산한다. 프레임마다 파이썬 루프를 돌면
+        # 긴 문장에서 눈에 띄게 느려진다.
+        block = data[: frames * step].reshape(frames, step)
+        window = np.hanning(step).astype(np.float32)
+        spectrum = np.abs(np.fft.rfft(block * window, axis=1))
+        freqs = np.fft.rfftfreq(step, 1 / sr)
+
+        rms = np.sqrt(np.mean(block * block, axis=1))
+        level = np.clip(rms / _ENVELOPE_REF, 0, 1)
+        out = [level]
+
+        # 대역은 '이 순간 소리의 몇 할이 이 대역인가' 로 낸다. 대역 안 성분을 평균 내면
+        # 넓은 대역일수록 값이 희석돼(고역은 대역폭이 저역의 20배다) 순수한 고음조차
+        # 0에 가깝게 나온다. 에너지 비율로 내면 대역폭과 무관해지고, 거기에 전체 세기를
+        # 곱하니 조용할 때는 모든 대역이 같이 가라앉는다.
+        power = spectrum ** 2
+        total = power.sum(axis=1) + 1e-9
+        for low, high in _BANDS:
+            sel = (freqs >= low) & (freqs < high)
+            if not sel.any():
+                out.append(np.zeros(frames, dtype=np.float32))
+                continue
+            share = np.sqrt(power[:, sel].sum(axis=1) / total)
+            out.append(np.clip(share * level, 0, 1))
+
+        # 소수점 둘째 자리면 눈으로 구분이 안 된다. JSON 크기를 절반으로 줄인다.
+        return np.round(np.stack(out, axis=1), 2).tolist()
     except Exception as exc:
         if DEBUG:
-            print("  (로컬 합성 실패 → 클라우드)", exc, flush=True)
-        return None
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            print("  (포락선 계산 실패)", exc, flush=True)
+        return []
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -317,6 +558,17 @@ class Jarvis:
             callback=self._on_audio,
         )
         self.oww = self._init_oww()
+        self.vad = VoiceDetector.create()
+        self.ws: "websocket.WebSocket | None" = None
+        self._ws_used = 0.0
+        # 스피커는 하나뿐이다. 알림 스레드와 응답 재생이 동시에 울리지 않게 직렬화한다.
+        self._speak_lock = threading.Lock()
+        # 대화 한 턴을 처리하는 동안 켜 둔다. 알림은 이게 꺼질 때까지 기다렸다 말한다.
+        self._busy = threading.Event()
+        self.running = True
+        # 마이크 세기 전송용. 슬롯 하나에 최신 값만 담고 보내는 스레드가 비운다.
+        self._level_slot: "tuple[float, float] | None" = None
+        self._level_wake = threading.Event()
 
     def _init_oww(self):
         """openWakeWord 엔진. 비활성/실패면 None(→ Vosk 폴백)."""
@@ -405,9 +657,43 @@ class Jarvis:
     def record_utterance(self, max_seconds: float = 12.0, initial_silence: float = 6.0) -> tuple[bytes, bool]:
         """말이 끝날 때까지 녹음. (오디오, 말했는지) 반환.
 
-        Vosk 내부 확정만 기다리면 끝이 늦게 잡혀 응답이 느려 보인다. 그래서 부분 인식이
-        END_SILENCE 동안 더 안 자라면(=말이 멈춤) 바로 종료한다.
+        목소리가 들리는지는 VAD 가 판정한다. 인식기(Vosk)에 맡기면 인식이 흔들릴 때
+        종료 판정도 같이 흔들린다 — 조용히 말하면 안 끝나고, 시끄러우면 중간에 끊긴다.
+        VAD 를 못 쓰면 예전처럼 Vosk 부분 결과가 자라는지로 판정한다.
         """
+        if self.vad is not None:
+            return self._record_with_vad(max_seconds, initial_silence)
+        return self._record_with_vosk(max_seconds, initial_silence)
+
+    def _record_with_vad(self, max_seconds: float, initial_silence: float) -> tuple[bytes, bool]:
+        self.vad.reset()
+        self._flush()
+        frames = bytearray()
+        spoke = False
+        start = last_voice = time.time()
+        while time.time() - start < max_seconds:
+            data = self.q.get()
+            frames += data
+            now = time.time()
+
+            prob = self.vad.feed(data)
+            # 듣는 동안 화면이 반응하도록 세기를 흘린다. VAD 확률은 이미 구한 값이라
+            # 덤으로 얹는다 — 목소리일 때만 입자가 크게 튄다.
+            self.hud_level(_block_level(data), prob)
+            if prob >= VAD_THRESHOLD:
+                spoke = True
+                last_voice = now
+                if DEBUG:
+                    print(f"  [vad] {prob:.2f}", flush=True)
+
+            if not spoke and now - start > initial_silence:
+                break
+            if spoke and now - last_voice > END_SILENCE:  # 말 멈춘 뒤 짧은 침묵 → 종료
+                break
+        return bytes(frames), spoke
+
+    def _record_with_vosk(self, max_seconds: float, initial_silence: float) -> tuple[bytes, bool]:
+        """VAD 없이 돌던 예전 방식. 부분 인식이 더 안 자라면 끝난 걸로 본다."""
         rec = KaldiRecognizer(self.model, SAMPLE_RATE)
         self._flush()
         frames = bytearray()
@@ -488,14 +774,58 @@ class Jarvis:
         for t in threads:
             t.join()
 
-    def chat(self, text: str) -> str:
+    def _connect(self) -> "websocket.WebSocket":
+        """백엔드 웹소켓을 준비한다. 살아 있으면 쓰던 걸 그대로 쓴다.
+
+        발화마다 새로 열면 턴마다 TCP·웹소켓 핸드셰이크와 인증 프레임이 앞에 붙는다.
+        이어 말하기(follow-up)로 10초마다 오가는 상황이나 원격으로 붙어 있을 때는
+        이 왕복이 그대로 첫 응답 지연이 된다.
+        """
+        ws = self.ws
+        if ws is not None and time.time() - self._ws_used <= WS_IDLE_MAX:
+            try:
+                if ws.connected:
+                    return ws
+            except Exception:
+                pass
+        self._close_ws()
+
         ws = websocket.create_connection(WS_URL, timeout=120)
         if TOKEN:
             ws.send(json.dumps({"token": TOKEN}))  # 첫 프레임이 인증
+        self.ws = ws
+        return ws
+
+    def _close_ws(self) -> None:
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def chat(self, text: str) -> str:
         payload = {"content": text}
         if DRIVE_MODE:
             payload["mode"] = "drive"  # 백엔드가 답변을 두세 문장으로 줄인다
-        ws.send(json.dumps(payload))
+        body = json.dumps(payload)
+
+        # 다시 붙는 건 '보내기까지'만이다. 토큰이 오기 시작한 뒤에 재시도하면 이미 말한
+        # 문장을 한 번 더 말하게 된다.
+        for last_try in (False, True):
+            try:
+                ws = self._connect()
+                ws.send(body)
+                break
+            except Exception:
+                self._close_ws()
+                if last_try:
+                    raise
+
+        return self._converse(ws)
+
+    def _converse(self, ws: "websocket.WebSocket") -> str:
+        """한 번의 응답을 끝까지 받아 말한다. 받은 전체 텍스트를 돌려준다."""
         speak_q, player = self._start_player()
         reply = ""
         buf = ""
@@ -540,8 +870,13 @@ class Jarvis:
                     reply = "처리 중에 문제가 생겼어: " + msg.get("message", "")
                     speak_q.put(reply)
                     break
+                # proactive 는 일부러 흘려보낸다. 능동 알림은 전용 리스너가 맡는다 —
+                # 여기서도 처리하면 같은 알림을 두 번 말하게 된다.
+            self._ws_used = time.time()  # 끝까지 정상으로 받았다 = 다음 턴에 재사용 가능
+        except Exception:
+            self._close_ws()  # 중간에 끊긴 연결은 상태가 어긋나 있다. 다음 턴에 새로 붙는다.
+            raise
         finally:
-            ws.close()
             if buf.strip():
                 speak_q.put(buf.strip())
             self._drain_player(speak_q, player)  # 다 말할 때까지 기다린다
@@ -577,13 +912,27 @@ class Jarvis:
             return None
 
     def _tts_play(self, audio, sr) -> None:
-        try:
-            sd.play(audio, sr, device=self.out_dev)
-            sd.wait()
-        except Exception as exc:
-            print("  (재생 실패)", exc)
-        finally:
-            self._flush()  # 자기 목소리가 다음 입력에 섞이지 않게
+        # 재생 직전에 포락선을 계산해 HUD 로 한 번 보낸다. 프레임마다 보내면 초당 수십 번
+        # 왕복이 나가고, 그 왕복이 재생 스레드를 막는다. 클립 전체를 한 번에 넘기고
+        # 화면이 자기 시계로 따라 그리게 하면 왕복은 1회로 끝난다.
+        envelope = _envelope(audio, sr)
+        # 전송이 재생을 늦추면 안 된다 — 띄워 놓고 바로 소리부터 낸다.
+        threading.Thread(
+            target=self.hud,
+            args=("speaking",),
+            kwargs={"envelope": envelope, "frame_ms": ENVELOPE_FRAME_MS},
+            daemon=True,
+        ).start()
+
+        # 알림 스레드가 끼어들어 응답 위에 겹쳐 울리는 걸 막는다.
+        with self._speak_lock:
+            try:
+                sd.play(audio, sr, device=self.out_dev)
+                sd.wait()
+            except Exception as exc:
+                print("  (재생 실패)", exc)
+            finally:
+                self._flush()  # 자기 목소리가 다음 입력에 섞이지 않게
 
     def say(self, text: str) -> None:
         """한 덩어리 텍스트를 합성해 바로 재생한다 (확인 질문 등 단발 용)."""
@@ -594,7 +943,12 @@ class Jarvis:
             self._tts_play(*clip)
 
     def prime_acks(self) -> None:
-        """깨움 응답을 시작 시 한 번만 합성해 캐시한다. 이후 깨움은 네트워크 왕복 없이 즉시 재생."""
+        """시작 시 한 번만 준비해 두는 것들.
+
+        깨움 응답은 미리 합성해 두면 이후 깨움이 네트워크 왕복 없이 즉시 나간다.
+        로컬 합성기도 여기서 띄워, 첫 답변이 COM 초기화를 기다리지 않게 한다.
+        """
+        _start_local_tts()
         self._ack_clips = [c for c in (self._tts_fetch(p) for p in WAKE_ACKS) if c is not None]
 
     def ack(self) -> None:
@@ -610,14 +964,88 @@ class Jarvis:
         sd.play(tone, SAMPLE_RATE, device=self.out_dev)
         sd.wait()
 
-    def hud(self, state: str, text: str = "") -> None:
-        """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort."""
+    # --- 능동 알림 ---
+    #
+    # 맡겨 둔 작업이 끝나거나 리마인더가 걸리면 백엔드가 연결된 모든 채팅 소켓으로
+    # 알림을 밀어 준다. 문제는 턴 사이에 그 소켓을 아무도 읽지 않는다는 것 — 다음에
+    # 말을 걸 때까지 알림이 버퍼에 갇힌다. 그래서 듣기만 하는 연결을 따로 하나 둔다.
+    # (대화 소켓에도 같은 알림이 오지만 _converse 는 그냥 흘려보낸다. 양쪽에서 처리하면
+    #  같은 알림을 두 번 말하게 된다.)
+
+    def _notify_listener(self) -> None:
+        while self.running:
+            try:
+                ws = websocket.create_connection(WS_URL_NOTIFY, timeout=NOTIFY_TIMEOUT)
+                if TOKEN:
+                    ws.send(json.dumps({"token": TOKEN}))
+            except Exception:
+                time.sleep(5)
+                continue
+
+            try:
+                while self.running:
+                    try:
+                        msg = json.loads(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue  # 조용한 시간. 연결은 살아 있다.
+                    if (msg or {}).get("type") != "proactive":
+                        continue
+                    content = str(msg.get("content") or "").strip()
+                    if content:
+                        self._announce(content)
+            except Exception:
+                pass  # 끊겼다. 위에서 다시 붙는다.
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            time.sleep(3)
+
+    def _announce(self, content: str) -> None:
+        """알림을 말한다. 대화 중이면 끝날 때까지 기다린다."""
+        print(f"\n[알림] {content}", flush=True)
+        # 말하는 중에 끼어들면 사용자 대화를 덮어쓴다. 잠깐이면 기다리고, 너무 길어지면
+        # 화면에는 이미 찍혔으니 음성은 포기한다.
+        for _ in range(int(NOTIFY_WAIT_MAX)):
+            if not self._busy.is_set():
+                break
+            time.sleep(1)
+        else:
+            return
+        self.say(content)
+
+    def hud_level(self, level: float, voice: float) -> None:
+        """듣는 중인 마이크 세기를 HUD 로 흘린다. 0.25초마다 불린다.
+
+        여기서 동기로 POST 하면 오디오 큐를 읽는 루프가 그만큼 막혀 소리를 놓친다.
+        그렇다고 매번 스레드를 띄우면 초당 네 개씩 쌓인다. 보내는 스레드 하나를 두고
+        최신 값만 넘긴다 — 늦은 값은 어차피 화면에서 의미가 없으니 버려도 된다.
+        """
+        self._level_slot = (round(level, 2), round(voice, 2))
+        self._level_wake.set()
+
+    def _level_sender(self) -> None:
+        while self.running:
+            self._level_wake.wait(timeout=1.0)
+            self._level_wake.clear()
+            slot, self._level_slot = self._level_slot, None
+            if slot is None:
+                continue
+            self.hud("listening", level=slot[0], voice=slot[1])
+
+    def hud(self, state: str, text: str = "", **extra) -> None:
+        """HUD 화면에 상태를 흘린다. 실패해도 음성 흐름을 막지 않게 best-effort.
+
+        extra 는 그대로 실려 화면까지 간다(예: 목소리 포락선). 서버는 payload 를
+        통째로 브로드캐스트하므로 필드를 늘려도 백엔드는 손댈 게 없다.
+        """
         try:
             requests.post(
                 f"{BACKEND}/hud/event",
-                json={"state": state, "text": text},
+                json={"state": state, "text": text, **extra},
                 headers=AUTH_HEADERS,
-                timeout=2,
+                timeout=5,
             )
         except Exception:
             pass
@@ -639,10 +1067,25 @@ class Jarvis:
             print(f"대기 중… {wake_hint}. (종료: Ctrl+C)", flush=True)
             if DRIVE_MODE:
                 print("운전 모드: 답변을 짧게 합니다.", flush=True)
+            # 첫 문장 목소리가 달라지는 건 눈치채기 어렵고 원인 찾기는 더 어렵다. 밝혀 둔다.
+            print(
+                "첫 덩어리 합성: "
+                + ("로컬(빠름, 첫 문장만 목소리 다름)" if TTS_FIRST_LOCAL else "클라우드(목소리 일관)"),
+                flush=True,
+            )
+            print(
+                "발화 종료 감지: " + ("VAD(Silero)" if self.vad is not None else "Vosk 부분 인식"),
+                flush=True,
+            )
             self.hud("idle")
+            # 맡겨 둔 작업이 끝나거나 리마인더가 걸리면 여기로 온다. 대기 중에도 듣는다.
+            threading.Thread(target=self._notify_listener, daemon=True).start()
+            # 마이크 세기를 화면으로 흘리는 전송기. 녹음 루프를 막지 않게 따로 돈다.
+            threading.Thread(target=self._level_sender, daemon=True).start()
             # 방금 답을 마쳤으면 잠깐은 깨우지 않고 이어 말할 수 있다(시리와 같은 방식).
             follow_up = False
             while True:
+                self._busy.clear()  # 여기서부터는 조용하다. 알림이 끼어들어도 된다.
                 if follow_up:
                     # 깨움 신호도 띵 소리도 없이 곧장 듣는다. 침묵하면 다시 대기로 돌아간다.
                     pcm, spoke = self.record_utterance(
@@ -666,6 +1109,7 @@ class Jarvis:
                         self.hud("idle")
                         continue
                 follow_up = False  # 아래에서 답을 마쳤을 때만 다시 켠다
+                self._busy.set()   # 여기부터 답을 마칠 때까지 알림은 기다린다
                 try:
                     text = self.stt(pcm)
                 except Exception as exc:
@@ -705,6 +1149,9 @@ def main() -> None:
         daemon.run()
     except KeyboardInterrupt:
         print("\n종료합니다.")
+    finally:
+        daemon.running = False  # 알림 리스너도 같이 내려간다
+        daemon._close_ws()
 
 
 if __name__ == "__main__":

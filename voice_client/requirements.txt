@@ -5,6 +5,8 @@ numpy>=1.26
 websocket-client>=1.7
 requests>=2.31
 openwakeword>=0.6
+# 웨이크워드와 발화 종료 감지(Silero VAD)가 같이 쓴다. VAD 는 ONNX 모델을 직접
+# 돌리므로 torch 가 필요 없다 — silero-vad 파이썬 패키지를 쓰면 그게 딸려 온다.
 onnxruntime>=1.17
 # Windows SAPI 로컬 음성 — 답변 첫 덩어리의 클라우드 왕복을 없애는 용도(선택).
 pywin32>=306
@@ -12,6 +14,6 @@ pywin32>=306
 # 비전 데몬(jarvis_vision.py) 전용. 음성만 쓸 거면 없어도 된다.
 # 얼굴은 OpenCV 의 YuNet + SFace 로 본다 — dlib·insightface 와 달리 pip 만으로 깔린다.
 opencv-python>=4.9
-# 제스처(두 손 모션). 파이썬 버전에 맞는 휠이 없으면 건너뛰어도 되고,
-# 그러면 데몬이 제스처만 끄고 나머지는 그대로 돈다.
-mediapipe>=0.10 ; python_version < "3.13"
+# 제스처(두 손 모션). Tasks API 를 쓰므로 0.10 과 1.0 양쪽에서 동작한다.
+# 휠이 없는 파이썬 버전이면 건너뛰어도 되고, 그러면 제스처만 꺼지고 나머지는 그대로 돈다.
+mediapipe>=0.10

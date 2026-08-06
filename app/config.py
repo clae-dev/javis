@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
-    llm_model: str = "gpt-4o"
+    llm_model: str = "gpt-4o"      
     fast_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     # text-embedding-3 계열은 차원을 줄여서 받을 수 있다(512/1024). 벡터가 작아지는 만큼

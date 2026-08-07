@@ -10,12 +10,13 @@
 
 import asyncio
 import base64
+import hashlib
 import logging
 
 from app.api.hud import hud_manager
-from app.tools.browser import _browser
+from app.tools.browser import _browser   
 
-log = logging.getLogger("javis.browserfeed")
+log = logging.getLogger("javis.browserfeed")  
 
 # 초당 몇 장. 웹페이지는 영상이 아니라 이 정도면 충분하고, 더 올리면 캡처가 CPU 를 먹는다.
 FPS = 2.0
@@ -31,11 +32,14 @@ async def _loop() -> None:
     global _page
     interval = 1.0 / FPS
     idle_rounds = 0
+    last_digest = b""
+    last_watchers = -1
     try:
         while True:
             # 보는 사람이 없으면 찍지 않는다. HUD 를 닫아 뒀는데 계속 캡처하면
             # 아무도 안 보는 그림 때문에 CPU 만 돈다.
-            if hud_manager.count == 0:
+            watchers = hud_manager.count
+            if watchers == 0:
                 idle_rounds += 1
                 if idle_rounds > 60:      # 30초 넘게 아무도 안 보면 접는다
                     log.info("보는 사람이 없어 브라우저 피드를 멈춥니다")
@@ -50,13 +54,21 @@ async def _loop() -> None:
                 log.warning("화면 캡처 실패: %s", exc)
                 break
 
-            await hud_manager.broadcast(
-                {
-                    "state": "browser",
-                    "url": _url,
-                    "frame": base64.b64encode(shot).decode("ascii"),
-                }
-            )
+            # 페이지가 그대로면 앞서 보낸 것과 똑같은 그림이다. 자비스가 페이지를 읽는
+            # 동안은 대개 아무것도 안 움직이는데, 그 정지 화면을 초당 두 번씩 base64
+            # 로 부풀려(1.33배) JSON 에 실어 보내면 서버·브라우저 양쪽이 같은 일을
+            # 반복한다. 새로 붙은 사람에게는 보여 줘야 하므로 보는 사람 수가 바뀌면
+            # 한 번은 다시 흘린다.
+            digest = hashlib.blake2b(shot, digest_size=16).digest()
+            if digest != last_digest or watchers != last_watchers:
+                last_digest, last_watchers = digest, watchers
+                await hud_manager.broadcast(
+                    {
+                        "state": "browser",
+                        "url": _url,
+                        "frame": base64.b64encode(shot).decode("ascii"),
+                    }
+                )
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         pass

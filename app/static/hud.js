@@ -138,8 +138,18 @@ const dust = Array.from({ length: PARTICLES }, () => ({
   band: Math.floor(Math.random() * 3),     // 이 입자가 반응할 대역
 }));
 
+// 입자마다 globalAlpha 를 바꾸고 fill 을 부르면 프레임당 상태 전환이 입자 수만큼
+// 난다(60fps 면 초당 2만 번이 넘는다). 눈은 알파를 그만큼 세밀하게 구분하지 못하니
+// 몇 단계로 뭉쳐서, 단계마다 경로 하나로 모아 한 번만 채운다.
+const ALPHA_STEPS = 6;
+const ALPHA_MAX = 0.95;
+const TAU = Math.PI * 2;
+// 프레임마다 새로 만들면 GC 가 돈다. 비우고 다시 채워 쓴다.
+const buckets = Array.from({ length: ALPHA_STEPS }, () => []);
+
 function drawDust(R) {
-  ctx.fillStyle = color;
+  for (const b of buckets) b.length = 0;
+
   for (const p of dust) {
     // 대역별로 다르게 밀어야 목소리의 결이 보인다. 전부 같이 움직이면 그냥 깜빡임이다.
     // 실제 말소리는 대역 값이 0.2 를 넘는 일이 드물어서(저역 우세, 고역은 0.01 언저리)
@@ -150,13 +160,28 @@ function drawDust(R) {
 
     const breathe = 1 + 0.05 * Math.sin(t * 1.4 + p.phase);
     const rr = R * (p.r * breathe + p.push * 1.15);
-    const x = Math.cos(p.a) * rr;
-    const y = Math.sin(p.a) * rr;
 
     // 멀리 밀려난 입자일수록 옅게 — 퍼져 나가 사라지는 인상을 준다.
-    ctx.globalAlpha = Math.max(0, Math.min(0.95, (0.3 + p.push * 0.8) * (1 - p.push * 0.3)));
+    const alpha = Math.max(0, Math.min(ALPHA_MAX, (0.3 + p.push * 0.8) * (1 - p.push * 0.3)));
+    const slot = Math.min(ALPHA_STEPS - 1, (alpha / ALPHA_MAX * ALPHA_STEPS) | 0);
+    buckets[slot].push(
+      Math.cos(p.a) * rr,
+      Math.sin(p.a) * rr,
+      dpr * p.size * (1.0 + p.push * 0.9),
+    );
+  }
+
+  ctx.fillStyle = color;
+  for (let i = 0; i < ALPHA_STEPS; i++) {
+    const b = buckets[i];
+    if (!b.length) continue;
+    ctx.globalAlpha = ((i + 0.5) / ALPHA_STEPS) * ALPHA_MAX;
     ctx.beginPath();
-    ctx.arc(x, y, dpr * p.size * (1.0 + p.push * 0.9), 0, Math.PI * 2);
+    for (let j = 0; j < b.length; j += 3) {
+      const x = b[j], y = b[j + 1], r = b[j + 2];
+      ctx.moveTo(x + r, y);   // 없으면 앞 입자와 선으로 이어진다
+      ctx.arc(x, y, r, 0, TAU);
+    }
     ctx.fill();
   }
 }
@@ -207,23 +232,22 @@ function draw() {
     ctx.stroke();
   }
 
-  // 원형 반응 바
+  // 원형 반응 바 — 굵기·색이 다 같으니 경로 하나에 모아 한 번에 긋는다.
   const N = 84;
+  const r0 = R * 1.32;
   ctx.globalAlpha = 0.9;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = dpr * 2.2;
+  ctx.beginPath();
   for (let i = 0; i < N; i++) {
-    const ang = (i / N) * Math.PI * 2;
+    const ang = (i / N) * TAU;
     const wob = 0.5 + 0.5 * Math.sin(t * 3 + i * 0.7) * Math.sin(t * 1.3 + i * 0.2);
     const len = R * (0.18 + energy * wob * 1.1);
-    const r0 = R * 1.32;
-    const x0 = Math.cos(ang) * r0, y0 = Math.sin(ang) * r0;
-    const x1 = Math.cos(ang) * (r0 + len), y1 = Math.sin(ang) * (r0 + len);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = dpr * 2.2;
-    ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.stroke();
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    ctx.moveTo(ca * r0, sa * r0);
+    ctx.lineTo(ca * (r0 + len), sa * (r0 + len));
   }
+  ctx.stroke();
 
   // 안쪽 점선 링 (역회전)
   ctx.globalAlpha = 0.6;
@@ -288,6 +312,9 @@ function flashPresence(text) {
 // jpeg 를 보내 준다 — 영상이 아니라서 이 정도면 충분하다.
 
 let browserBox = null;
+let browserImg = null;
+let browserLabel = null;
+let browserUrl = "";
 
 function showBrowser(frame, url) {
   if (!frame) return;
@@ -296,14 +323,23 @@ function showBrowser(frame, url) {
     browserBox.className = "browser-feed";
     browserBox.innerHTML = '<img alt="" /><span></span>';
     document.body.appendChild(browserBox);
+    // 프레임마다 다시 찾을 이유가 없다. 상자를 만들 때 한 번 잡아 둔다.
+    browserImg = browserBox.querySelector("img");
+    browserLabel = browserBox.querySelector("span");
+    browserUrl = "";
   }
-  browserBox.querySelector("img").src = "data:image/jpeg;base64," + frame;
-  browserBox.querySelector("span").textContent = url || "";
+  browserImg.src = "data:image/jpeg;base64," + frame;
+  // 주소는 페이지가 바뀔 때만 바뀐다. 같은 값을 다시 넣으면 그때마다 레이아웃이 돈다.
+  if (url !== browserUrl) {
+    browserUrl = url || "";
+    browserLabel.textContent = browserUrl;
+  }
 }
 
 function hideBrowser() {
   browserBox?.remove();
-  browserBox = null;
+  browserBox = browserImg = browserLabel = null;
+  browserUrl = "";
 }
 
 // --- WebSocket ---

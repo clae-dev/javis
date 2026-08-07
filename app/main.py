@@ -11,6 +11,7 @@ from app.agent.graph import build_graph, make_checkpointer
 from app.agent.runtime import runtime
 from app.api import hud, rest, vision, voice, ws
 from app.config import settings
+from app.db import audit
 from app.db.session import init_db
 from app.tools import browser
 
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             scheduler.stop()
+            # 감사 로그는 묶어서 쓴다. 마지막 묶음이 큐에 남은 채 내려가면 그 기록만 사라진다.
+            await audit.flush()
             # 브라우저를 안 닫으면 프로필 폴더 잠금이 남아 다음 기동이 막힌다.
             await browser.close()
 

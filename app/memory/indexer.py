@@ -15,6 +15,7 @@ pgvector 에 넣는다. 장기 기억(long_term)이 '대화에서 추려낸 문�
 import asyncio
 import hashlib
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,15 +77,21 @@ def _extensions() -> set[str]:
 
 
 def _walk(root: Path) -> list[Path]:
+    """노트 파일만 골라 온다.
+
+    건너뛸 폴더는 들어가기 전에 쳐낸다. 다 훑고 나서 거르면 .obsidian 이나
+    node_modules 처럼 파일이 수천 개 든 폴더까지 전부 stat 한 뒤 버리는 셈이라,
+    바뀐 게 하나도 없는 주기(10분마다 돈다)가 폴더 크기에 비례해 무거워진다.
+    """
     wanted = _extensions()
     found: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in wanted:
-            continue
-        parts = set(path.relative_to(root).parts[:-1])
-        if parts & _SKIP_DIRS or path.name.startswith("."):
-            continue
-        found.append(path)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        base = Path(dirpath)
+        for name in filenames:
+            if name.startswith(".") or os.path.splitext(name)[1].lower() not in wanted:
+                continue
+            found.append(base / name)
     return sorted(found)
 
 

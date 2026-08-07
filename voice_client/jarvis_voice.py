@@ -122,6 +122,29 @@ TTS_FIRST_LOCAL = DRIVE_MODE if _first_local == "auto" else _first_local != "0"
 WS_IDLE_MAX = float(os.environ.get("JAVIS_WS_IDLE_MAX", "120"))
 
 
+_http_local = threading.local()
+
+
+def _http() -> requests.Session:
+    """백엔드로 나가는 HTTP 세션. 스레드마다 하나씩 들고 재사용한다.
+
+    `requests.post` 는 부를 때마다 새 연결을 연다. 듣는 동안 HUD 세기를 초당 네 번씩
+    보내는데, 그때마다 TCP 핸드셰이크(원격이면 TLS 까지)가 앞에 붙고 그 왕복이 그
+    스레드를 그대로 붙잡는다. 세션을 들고 있으면 keep-alive 로 연결이 재사용된다.
+
+    스레드마다 따로 두는 건 requests.Session 이 스레드 안전을 보장하지 않아서다.
+    어차피 이득을 보는 쪽(세기 전송기, 합성·재생 루프)은 각자 같은 스레드에서
+    반복해 부르는 자리라, 공유하지 않아도 재사용률은 그대로다.
+    """
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        if AUTH_HEADERS:
+            session.headers.update(AUTH_HEADERS)
+        _http_local.session = session
+    return session
+
+
 def _resolve_device(hint: str, kind: str):
     """이름 일부로 오디오 장치를 찾는다. 못 찾거나 힌트가 없으면 None(기본 장치)."""
     if not hint:
@@ -543,9 +566,9 @@ class ClapDetector:
 
 
 class Jarvis:
-    def __init__(self, model_path: str) -> None:
+    def __init__(self) -> None:
         SetLogLevel(-1)
-        self.model = Model(model_path)
+        self._model: "Model | None" = None
         self.q: queue.Queue[bytes] = queue.Queue()
         self.in_dev = _resolve_device(INPUT_HINT, "input")
         self.out_dev = _resolve_device(OUTPUT_HINT, "output")
@@ -559,6 +582,10 @@ class Jarvis:
         )
         self.oww = self._init_oww()
         self.vad = VoiceDetector.create()
+        # 둘 중 하나라도 못 뜨면 그 자리를 Vosk 가 메운다. 그때는 미리 올려 둔다 —
+        # 깨우는 순간이나 말을 시작한 순간에 몇 초씩 멈추면 그대로 놓친다.
+        if self.oww is None or self.vad is None:
+            _ = self.model
         self.ws: "websocket.WebSocket | None" = None
         self._ws_used = 0.0
         # 스피커는 하나뿐이다. 알림 스레드와 응답 재생이 동시에 울리지 않게 직렬화한다.
@@ -569,6 +596,20 @@ class Jarvis:
         # 마이크 세기 전송용. 슬롯 하나에 최신 값만 담고 보내는 스레드가 비운다.
         self._level_slot: "tuple[float, float] | None" = None
         self._level_wake = threading.Event()
+        # 포락선처럼 '빠뜨리면 안 되지만 기다릴 이유도 없는' HUD 전송을 모아 두는 줄.
+        self._hud_q: "queue.Queue[tuple[str, str, dict] | None]" = queue.Queue()
+
+    @property
+    def model(self) -> Model:
+        """Vosk 모델. 실제로 쓰게 될 때 처음 부르는 쪽에서 올린다.
+
+        openWakeWord 와 Silero VAD 가 둘 다 뜬 기본 구성에서는 한 번도 안 쓰인다.
+        그런데도 기동할 때마다 50MB 를 읽어 메모리에 얹고 있었다 — 첫 실행이라면
+        같은 크기를 내려받기까지 한다. 폴백으로 물러난 경우에만 값을 치른다.
+        """
+        if self._model is None:
+            self._model = Model(ensure_model())
+        return self._model
 
     def _init_oww(self):
         """openWakeWord 엔진. 비활성/실패면 None(→ Vosk 폴백)."""
@@ -724,7 +765,7 @@ class Jarvis:
 
     def stt(self, pcm: bytes) -> str:
         files = {"file": ("cmd.wav", pcm_to_wav(pcm), "audio/wav")}
-        r = requests.post(f"{BACKEND}/voice/stt", files=files, headers=AUTH_HEADERS, timeout=60)
+        r = _http().post(f"{BACKEND}/voice/stt", files=files, timeout=60)
         r.raise_for_status()
         return r.json().get("text", "").strip()
 
@@ -896,10 +937,9 @@ class Jarvis:
     def _tts_fetch(self, text: str):
         """문장 하나를 오디오로 합성. (audio, sr) 또는 실패 시 None."""
         try:
-            r = requests.post(
+            r = _http().post(
                 f"{BACKEND}/voice/tts",
                 json={"text": text, "format": "wav"},
-                headers=AUTH_HEADERS,
                 timeout=120,
             )
             if r.status_code != 200:
@@ -916,13 +956,8 @@ class Jarvis:
         # 왕복이 나가고, 그 왕복이 재생 스레드를 막는다. 클립 전체를 한 번에 넘기고
         # 화면이 자기 시계로 따라 그리게 하면 왕복은 1회로 끝난다.
         envelope = _envelope(audio, sr)
-        # 전송이 재생을 늦추면 안 된다 — 띄워 놓고 바로 소리부터 낸다.
-        threading.Thread(
-            target=self.hud,
-            args=("speaking",),
-            kwargs={"envelope": envelope, "frame_ms": ENVELOPE_FRAME_MS},
-            daemon=True,
-        ).start()
+        # 전송이 재생을 늦추면 안 된다 — 줄에 걸어 두고 바로 소리부터 낸다.
+        self._hud_q.put(("speaking", "", {"envelope": envelope, "frame_ms": ENVELOPE_FRAME_MS}))
 
         # 알림 스레드가 끼어들어 응답 위에 겹쳐 울리는 걸 막는다.
         with self._speak_lock:
@@ -1025,6 +1060,20 @@ class Jarvis:
         self._level_slot = (round(level, 2), round(voice, 2))
         self._level_wake.set()
 
+    def _hud_sender(self) -> None:
+        """줄에 걸린 HUD 전송을 순서대로 내보낸다.
+
+        보낼 때마다 스레드를 새로 띄우면 문장 하나에 스레드가 하나씩 생기고, 세션이
+        스레드마다 따로라 매번 연결도 새로 연다. 하나로 모으면 스레드도 연결도 계속
+        재사용되고, 보낸 순서가 그대로 지켜진다.
+        """
+        while True:
+            job = self._hud_q.get()
+            if job is None:
+                return
+            state, text, extra = job
+            self.hud(state, text, **extra)
+
     def _level_sender(self) -> None:
         while self.running:
             self._level_wake.wait(timeout=1.0)
@@ -1041,10 +1090,9 @@ class Jarvis:
         통째로 브로드캐스트하므로 필드를 늘려도 백엔드는 손댈 게 없다.
         """
         try:
-            requests.post(
+            _http().post(
                 f"{BACKEND}/hud/event",
                 json={"state": state, "text": text, **extra},
-                headers=AUTH_HEADERS,
                 timeout=5,
             )
         except Exception:
@@ -1082,6 +1130,8 @@ class Jarvis:
             threading.Thread(target=self._notify_listener, daemon=True).start()
             # 마이크 세기를 화면으로 흘리는 전송기. 녹음 루프를 막지 않게 따로 돈다.
             threading.Thread(target=self._level_sender, daemon=True).start()
+            # 포락선처럼 빠뜨리면 안 되는 HUD 전송을 순서대로 내보내는 전송기.
+            threading.Thread(target=self._hud_sender, daemon=True).start()
             # 방금 답을 마쳤으면 잠깐은 깨우지 않고 이어 말할 수 있다(시리와 같은 방식).
             follow_up = False
             while True:
@@ -1139,12 +1189,11 @@ class Jarvis:
 
 def main() -> None:
     try:
-        model_path = ensure_model()
+        daemon = Jarvis()
     except Exception as exc:
-        print("모델 준비 실패:", exc)
+        print("음성 데몬을 시작하지 못했습니다:", exc)
         sys.exit(1)
 
-    daemon = Jarvis(model_path)
     try:
         daemon.run()
     except KeyboardInterrupt:

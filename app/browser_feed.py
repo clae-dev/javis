@@ -13,9 +13,9 @@ import base64
 import logging
 
 from app.api.hud import hud_manager
-from app.tools.browser import _browser
+from app.tools.browser import _browser   
 
-log = logging.getLogger("javis.browserfeed")
+log = logging.getLogger("javis.browserfeed")  
 
 # 초당 몇 장. 웹페이지는 영상이 아니라 이 정도면 충분하고, 더 올리면 캡처가 CPU 를 먹는다.
 FPS = 2.0
